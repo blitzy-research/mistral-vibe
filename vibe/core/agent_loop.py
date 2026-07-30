@@ -129,6 +129,7 @@ class AgentLoop:
 
         self.message_observer = message_observer
         self._last_observed_message_index: int = 0
+        self._turn_boundaries: list[int] = []
         self.enable_streaming = enable_streaming
         self.middleware_pipeline = MiddlewarePipeline()
         self._setup_middleware()
@@ -300,6 +301,7 @@ class AgentLoop:
 
     async def _conversation_loop(self, user_msg: str) -> AsyncGenerator[BaseEvent]:
         user_message = LLMMessage(role=Role.user, content=user_msg)
+        self._turn_boundaries.append(len(self.messages))
         self.messages.append(user_message)
         self.stats.steps += 1
 
@@ -805,6 +807,7 @@ class AgentLoop:
             self.agent_profile,
         )
         self.messages = self.messages[:1]
+        self._turn_boundaries.clear()
 
         self.stats = AgentStats()
         self.stats.trigger_listeners()
@@ -820,6 +823,42 @@ class AgentLoop:
         self.middleware_pipeline.reset()
         self.tool_manager.reset_all()
         self._reset_session()
+
+    def undo_last_turn(self) -> str | None:
+        """Rewind the conversation by exactly one user turn.
+
+        Truncates the message list back to the most recently recorded turn
+        boundary, discarding the user message that opened that turn together with
+        everything appended after it: the assistant reply and any tool call or
+        tool response messages. Repeated calls walk further back through the
+        transcript, one turn per call. The system message at index 0 always
+        survives, cumulative session statistics are deliberately left untouched
+        so they behave as they do across a reload, and no backend is contacted.
+
+        Returns:
+            The content of the removed user message, or None when there is no
+            turn left to undo
+        """
+        while self._turn_boundaries:
+            # A boundary recorded before a clear_history or compact call now
+            # points past the end of the shortened list. Discard it and keep
+            # walking back rather than indexing out of range.
+            if (boundary := self._turn_boundaries.pop()) >= len(self.messages):
+                continue
+
+            # Capture the content first: the slice below discards that message.
+            removed_content = self.messages[boundary].content
+            self.messages = self.messages[:boundary]
+
+            # Truncation can leave the observer index past the new end of the
+            # list, which would make _flush_new_messages return early and drop
+            # every later message. Programmatic and ACP embedders rely on this.
+            self._last_observed_message_index = min(
+                self._last_observed_message_index, len(self.messages)
+            )
+            return removed_content
+
+        return None
 
     async def compact(self) -> str:
         """Compact the conversation history."""
@@ -847,6 +886,7 @@ class AgentLoop:
             system_message = self.messages[0]
             summary_message = LLMMessage(role=Role.user, content=summary_content)
             self.messages = [system_message, summary_message]
+            self._turn_boundaries.clear()
 
             active_model = self.config.get_active_model()
             provider = self.config.get_provider_for_model(active_model)
