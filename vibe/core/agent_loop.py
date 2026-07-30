@@ -831,13 +831,14 @@ class AgentLoop:
         boundary, discarding the user message that opened that turn together with
         everything appended after it: the assistant reply and any tool call or
         tool response messages. Repeated calls walk further back through the
-        transcript, one turn per call. The system message at index 0 always
+        transcript, one turn per call. Boundaries left stale by a history clear
+        or a compaction are skipped. The system message at index 0 always
         survives, cumulative session statistics are deliberately left untouched
         so they behave as they do across a reload, and no backend is contacted.
 
         Returns:
             The content of the removed user message, or None when there is no
-            turn left to undo
+            recorded turn left to undo
         """
         while self._turn_boundaries:
             # A boundary recorded before a clear_history or compact call now
