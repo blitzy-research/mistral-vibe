@@ -5,13 +5,20 @@ The streaming loop collects the chunks that `_on_content_block_start` and
 so a regression that dropped either handler's result, or the trailing yield
 loop, would silently discard Anthropic text and tool-call output while still
 compiling cleanly. Every scenario below drives the real loop over scripted
-Anthropic SDK events through an injected fake client, so no request is ever
-built, no credential is read and no socket is opened.
+Anthropic SDK events through an injected fake client, so no request is ever built
+and no socket is opened.
+
+The backend reads its credential from the environment as it is constructed, and
+the root fixtures stub only the Mistral variable, so an autouse fixture here
+replaces the Anthropic one with a fake for the duration of every test: whatever
+the host happens to provide is never read, and the fake client asserts that the
+fake value is the only credential it was ever handed.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Sequence
+import os
 from typing import Any
 
 import anthropic
@@ -44,15 +51,29 @@ type StreamEvent = (
 )
 
 PROMPT = "Just say hi"
+ANTHROPIC_API_KEY_VARIABLE = "ANTHROPIC_API_KEY"
+# Recognisable on sight and valid nowhere, so a credential leaking into an
+# assertion failure or a captured request is provably not a real one.
+FAKE_API_KEY = "sk-ant-fake-key-for-tests"
 PROVIDER = ProviderConfig(
     name="anthropic",
     api_base="https://api.anthropic.com",
-    api_key_env_var="ANTHROPIC_API_KEY",
+    api_key_env_var=ANTHROPIC_API_KEY_VARIABLE,
     backend=Backend.ANTHROPIC,
 )
 MODEL = ModelConfig(
     name="claude-streaming-test", provider="anthropic", alias="claude-alias"
 )
+
+
+@pytest.fixture(autouse=True)
+def _fake_anthropic_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the host's Anthropic credential with a fake one for every test.
+
+    `AnthropicBackend` resolves the variable named by its provider as it is
+    constructed, so this has to be in place before any backend exists.
+    """
+    monkeypatch.setenv(ANTHROPIC_API_KEY_VARIABLE, FAKE_API_KEY)
 
 
 class FakeMessageStream:
@@ -90,6 +111,19 @@ class FakeAnthropicClient:
     def __init__(self, events: Sequence[StreamEvent]) -> None:
         self.messages = FakeMessages(events)
         self.closed = False
+        # Every set of arguments the backend constructed a client with, so the
+        # credential it passed can be asserted rather than assumed.
+        self.construction_kwargs: list[dict[str, Any]] = []
+
+    def record_construction(self, **kwargs: Any) -> FakeAnthropicClient:
+        """Stand in for the `anthropic.AsyncAnthropic` constructor itself.
+
+        Returns:
+            This same client, so every construction the backend performs is both
+            recorded and served by the one fake
+        """
+        self.construction_kwargs.append(kwargs)
+        return self
 
     async def close(self) -> None:
         self.closed = True
@@ -179,7 +213,7 @@ async def stream_chunks(
         The chunks the backend emitted, and the fake client it used
     """
     client = FakeAnthropicClient(events)
-    monkeypatch.setattr(anthropic, "AsyncAnthropic", lambda **_: client)
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", client.record_construction)
 
     backend = AnthropicBackend(provider=PROVIDER)
     async with backend:
@@ -360,3 +394,19 @@ class TestStreamingIsHermetic:
         ]
         assert "tools" not in client.messages.stream_calls[0]
         assert client.closed is True
+
+    @pytest.mark.asyncio
+    async def test_the_backend_is_only_ever_handed_the_fake_credential(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Whatever the host exports, the autouse fixture is what the backend sees.
+        assert os.environ[ANTHROPIC_API_KEY_VARIABLE] == FAKE_API_KEY
+
+        _, client = await stream_chunks(monkeypatch, [text_delta(0, "Hello, world.")])
+
+        # Every client the backend built was handed the fake key and nothing else,
+        # so no host credential can reach a request, a log or a failure message.
+        assert client.construction_kwargs != []
+        assert {kwargs["api_key"] for kwargs in client.construction_kwargs} == {
+            FAKE_API_KEY
+        }

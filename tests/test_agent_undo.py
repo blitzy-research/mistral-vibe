@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
+import json
+from pathlib import Path
 from typing import NamedTuple
 
 import pytest
@@ -37,12 +39,14 @@ def make_config(
     active_model: str = "devstral-latest",
     enabled_tools: list[str] | None = None,
     tools: dict[str, BaseToolConfig] | None = None,
+    session_logging: SessionLoggingConfig | None = None,
 ) -> VibeConfig:
     """Build a hermetic configuration for the stubbed undo scenarios.
 
-    Session logging and auto-compaction are both off so nothing rewrites the
-    transcript mid-test, and no tool is enabled unless a scenario asks for one,
-    so every other turn appends exactly two messages.
+    Auto-compaction is off so nothing rewrites the transcript mid-test, and no
+    tool is enabled unless a scenario asks for one, so every other turn appends
+    exactly two messages. Session logging is off unless a scenario supplies its
+    own configuration pointing at a temporary directory.
     """
     models = [
         ModelConfig(
@@ -62,7 +66,7 @@ def make_config(
         )
     ]
     return VibeConfig(
-        session_logging=SessionLoggingConfig(enabled=False),
+        session_logging=session_logging or SessionLoggingConfig(enabled=False),
         auto_compact_threshold=0,
         system_prompt_id=system_prompt_id,
         include_project_context=False,
@@ -142,6 +146,58 @@ def assert_system_message_intact(
     assert agent.messages[0] is original
     assert agent.messages[0] == values
     assert agent.messages[0].role == Role.system
+
+
+def logging_config(save_dir: Path) -> VibeConfig:
+    """Build the stubbed configuration with session logging on, under save_dir.
+
+    Returns:
+        A configuration whose session logger writes into the given directory
+    """
+    return make_config(
+        session_logging=SessionLoggingConfig(enabled=True, save_dir=str(save_dir))
+    )
+
+
+class SessionLogState(NamedTuple):
+    """What a session directory holds: its message records and its cursor."""
+
+    logged: list[tuple[str, str]]
+    cursor: int
+
+
+def read_session_log(save_dir: Path) -> SessionLogState:
+    """Read the single session directory the stubbed turns wrote.
+
+    Returns:
+        The role and content of every persisted message, in order, and the
+        message count the logger resumes appending from
+    """
+    session_dirs = sorted(save_dir.glob("session_*"))
+    assert len(session_dirs) == 1
+    session_dir = session_dirs[0]
+
+    lines = (session_dir / "messages.jsonl").read_text(encoding="utf-8").splitlines()
+    metadata = json.loads((session_dir / "meta.json").read_text(encoding="utf-8"))
+    records = [json.loads(line) for line in lines]
+    return SessionLogState(
+        logged=[(record["role"], record["content"]) for record in records],
+        cursor=metadata["total_messages"],
+    )
+
+
+def persisted_first_two_turns() -> list[tuple[str, str]]:
+    """Return the records the two stubbed opening turns leave in a session log.
+
+    Returns:
+        The role and content of every message those two turns persist, in order
+    """
+    return [
+        ("user", "First"),
+        ("assistant", "R1"),
+        ("user", "Second"),
+        ("assistant", "R2"),
+    ]
 
 
 class TestUndoRewindsOneTurn:
@@ -747,3 +803,70 @@ class TestUndoIsRefusedWhileTheHistoryIsClaimed:
         # The turn's claim is released only now, and compact() already dropped
         # the boundaries it invalidated, so there is nothing left to undo.
         assert agent.undo_last_turn() is None
+
+
+class TestUndoLeavesTheWrittenSessionLogAlone:
+    @pytest.mark.asyncio
+    async def test_undo_itself_writes_nothing_to_the_session_log(
+        self, tmp_path: Path
+    ) -> None:
+        backend = backend_with_sentinel("R1", "R2")
+        save_dir = tmp_path / "sessions"
+        agent = AgentLoop(logging_config(save_dir), backend=backend)
+
+        async for _ in agent.act("First"):
+            pass
+        async for _ in agent.act("Second"):
+            pass
+
+        persisted = read_session_log(save_dir)
+        assert persisted.logged == persisted_first_two_turns()
+        assert persisted.cursor == 4
+
+        assert agent.undo_last_turn() == "Second"
+
+        # The rewind is purely in memory and performs no I/O whatsoever, so the
+        # session keeps every record it had written, cursor included.
+        assert read_session_log(save_dir) == persisted
+
+    @pytest.mark.asyncio
+    async def test_a_turn_refilling_the_rewound_span_is_not_appended(
+        self, tmp_path: Path
+    ) -> None:
+        backend = backend_with_sentinel("R1", "R2", "R2 again", "R3")
+        save_dir = tmp_path / "sessions"
+        agent = AgentLoop(logging_config(save_dir), backend=backend)
+
+        async for _ in agent.act("First"):
+            pass
+        async for _ in agent.act("Second"):
+            pass
+        assert agent.undo_last_turn() == "Second"
+
+        async for _ in agent.act("Second again"):
+            pass
+
+        # Pinned deliberately rather than fixed. The logger appends whatever the
+        # transcript holds beyond the count it last persisted
+        # (vibe/core/session/session_logger.py), and a rewind lowers that count
+        # without touching what was written, so a turn refilling the rewound span
+        # sits inside the already-persisted range and is not appended. Undo
+        # neither rewrites the log nor rolls the session over the way /clear and
+        # /compact do, because it rewinds the transcript rather than discarding
+        # the session. Revisit this assertion with the logger if its cursoring
+        # ever becomes identity-based.
+        refilled = read_session_log(save_dir)
+        assert refilled.logged == persisted_first_two_turns()
+        assert refilled.cursor == 4
+        assert agent.messages[3].content == "Second again"
+
+        async for _ in agent.act("Third"):
+            pass
+
+        # A turn past the persisted range is appended as usual, so logging
+        # resumes rather than stopping: only the refilling turn stays missing.
+        resumed = read_session_log(save_dir)
+        assert resumed.logged[:4] == persisted_first_two_turns()
+        assert resumed.logged[4:] == [("user", "Third"), ("assistant", "R3")]
+        assert resumed.cursor == 6
+        assert all("again" not in content for _, content in resumed.logged)

@@ -12,6 +12,8 @@ asserts on the widgets actually mounted, in the order they were mounted.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
+import unicodedata
 
 import pytest
 from textual.widget import Widget
@@ -19,6 +21,7 @@ from textual.widget import Widget
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from vibe.cli.textual_ui.app import VibeApp
+from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from vibe.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     ErrorMessage,
@@ -30,6 +33,9 @@ from vibe.core.config import SessionLoggingConfig, VibeConfig
 from vibe.core.types import LLMMessage, Role
 
 BUSY_REFUSAL = "Cannot undo while agent loop is processing. Please wait."
+# Long enough that the stand-in turn is still pending when the assertions run,
+# and always cancelled by the test rather than waited on.
+STALLED_TURN_TIMEOUT = 30.0
 # The request below is 89 characters, so it overruns the eighty-character
 # confirmation budget: the handler keeps the first 79 characters and spends the
 # eightieth on a single ellipsis. The expected summary is spelled out rather
@@ -47,6 +53,24 @@ MARKDOWN_REQUEST = "Explain **bold** and `code` in [docs](https://x.test)"
 MARKDOWN_REQUEST_SUMMARY = (
     "Explain \\*\\*bold\\*\\* and \\`code\\` in \\[docs\\]\\(https\\:\\/\\/x\\.test\\)"
 )
+# A prompt carrying an ESC-introduced screen erase, a BEL, a raw C1 control
+# sequence introducer, a right-to-left override with its terminating pop, and a
+# DEL. Markdown escaping neuters none of them, and the renderer beneath the
+# widgets filters only a handful of C0 codes, so the handler has to remove them
+# before the confirmation can be written to a terminal. Every visible character
+# survives, including the erase sequence's now-inert "[2J" payload.
+CONTROL_REQUEST = "Delete \x1b[2Jthe repo\x07 \x9b31m \u202ered \u202cnow\x7f"
+CONTROL_REQUEST_SUMMARY = "Delete \\[2Jthe repo 31m red now"
+# Window-title and hyperlink operating-system-command sequences, terminated by
+# BEL and by ESC-backslash respectively, alongside a bidirectional isolate pair
+# and a zero-width space.
+OSC_REQUEST = (
+    "Set \x1b]0;pwned\x07 title \u2066and\u2069 \u200blink"
+    " \x1b]8;;https://x.test\x1b\\here\x1b]8;;\x1b\\"
+)
+# Enough blank lines before, and content lines after, that copying the prompt or
+# listing its lines to find the first one would be plainly wasteful.
+HOSTILE_LINE_COUNT = 20_000
 
 
 def make_config() -> VibeConfig:
@@ -84,6 +108,48 @@ async def agent_with_turns(*prompts: str) -> AgentLoop:
         async for _ in agent.act(prompt):
             pass
     return agent
+
+
+class GuardedPrompt(str):
+    """A prompt that refuses the whole-prompt operations a preview must avoid.
+
+    Recovering one short line must not copy the entire prompt, nor build a list
+    holding every line of it, so a prompt pasted at any size costs the same as a
+    short one. Both operations are trapped here rather than timed, which keeps the
+    guarantee deterministic instead of dependent on how fast the test host is.
+    """
+
+    __slots__ = ()
+
+    def strip(self, chars: str | None = None, /) -> str:
+        raise AssertionError("the preview must not copy the whole prompt")
+
+    def splitlines(self, keepends: bool = False) -> list[str]:
+        raise AssertionError("the preview must not materialise every line")
+
+
+def start_stalled_turn(app: VibeApp) -> asyncio.Task[None]:
+    """Put the application into the state it holds while a turn is streaming.
+
+    The task stands in for the conversation worker: it never finishes on its own,
+    so the submit path has a live turn it could cancel.
+
+    Returns:
+        The task the application will treat as the running turn
+    """
+    turn = asyncio.create_task(asyncio.sleep(STALLED_TURN_TIMEOUT))
+    app._agent_running = True
+    app._agent_task = turn
+    return turn
+
+
+async def finish_stalled_turn(app: VibeApp, turn: asyncio.Task[None]) -> None:
+    """Cancel the stand-in turn and clear the busy state it established."""
+    turn.cancel()
+    with suppress(asyncio.CancelledError):
+        await turn
+    app._agent_running = False
+    app._agent_task = None
 
 
 def widget_content(widget: Widget) -> str | None:
@@ -300,6 +366,87 @@ class TestUndoConfirmationSummary:
             assert rendered(app)[-1] == ("UserCommandMessage", "Undid last turn.")
 
 
+class TestUndoConfirmationIsSafeToRender:
+    """The confirmation quotes recovered text, so it must be inert and bounded.
+
+    The quoted prompt reaches a widget that renders Markdown and is ultimately
+    written to a terminal, and it can be arbitrarily large and arbitrarily
+    hostile: pasted, restored from a session or supplied by an embedder.
+    """
+
+    @pytest.mark.asyncio
+    async def test_terminal_escape_and_direction_controls_are_stripped(self) -> None:
+        agent = await agent_with_turns(CONTROL_REQUEST)
+        app = VibeApp(agent_loop=agent)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/undo")
+
+            assert rendered(app)[-1] == (
+                "UserCommandMessage",
+                f"Undid last turn: {CONTROL_REQUEST_SUMMARY}",
+            )
+
+    @pytest.mark.asyncio
+    async def test_no_control_or_format_character_survives_the_preview(self) -> None:
+        agent = await agent_with_turns(OSC_REQUEST)
+        app = VibeApp(agent_loop=agent)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/undo")
+
+            confirmation = rendered(app)[-1][1]
+
+            assert confirmation is not None
+            # Nothing in the Unicode control or format categories is left, which
+            # covers every escape introducer, the C1 range and the bidirectional
+            # and zero-width characters, whatever their combination.
+            assert not [
+                character
+                for character in confirmation
+                if unicodedata.category(character).startswith("C")
+            ]
+            # Only the invisible characters were removed: the words remain, so a
+            # reader still recognises the prompt that was undone.
+            assert "Set " in confirmation
+            assert "pwned" in confirmation
+            assert "title" in confirmation
+
+    @pytest.mark.asyncio
+    async def test_a_prompt_of_countless_lines_is_previewed_without_copying_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = await agent_with_turns("First")
+        app = VibeApp(agent_loop=agent)
+        hostile = GuardedPrompt(
+            "\n" * HOSTILE_LINE_COUNT
+            + "Refactor everything"
+            + "\ntrailing noise" * HOSTILE_LINE_COUNT
+        )
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            # Returning the prompt straight from the rewind keeps the guarded
+            # object intact all the way into the handler.
+            monkeypatch.setattr(agent, "undo_last_turn", lambda: hostile)
+
+            await app._handle_command("/undo")
+
+            # The leading blank lines are skipped and the first line with content
+            # is quoted, exactly as before, but a copy of the prompt or a list of
+            # its lines would have raised out of GuardedPrompt and surfaced here
+            # as a failure message instead of this confirmation.
+            assert rendered(app)[-1] == (
+                "UserCommandMessage",
+                "Undid last turn: Refactor everything",
+            )
+
+
 class TestUndoWithNothingToUndo:
     @pytest.mark.asyncio
     async def test_a_no_op_reports_itself_and_destroys_nothing(self) -> None:
@@ -375,6 +522,67 @@ class TestUndoIsRefusedWhileTheAgentIsRunning:
         assert len(agent.messages) == 5
         assert agent._turn_boundaries == [1, 3]
 
+    @pytest.mark.asyncio
+    async def test_submitting_undo_leaves_the_running_turn_alone(self) -> None:
+        # The guard is only worth anything if the real submit path reaches it
+        # with the turn still running. Every other submission interrupts first,
+        # which would cancel the turn - possibly after a tool had already had an
+        # effect - and then let the rewind proceed as if nothing had been busy.
+        agent = await agent_with_turns("First", "Second")
+        app = VibeApp(agent_loop=agent)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            turn = start_stalled_turn(app)
+
+            app.post_message(ChatInputContainer.Submitted("/undo"))
+            await pilot.pause()
+
+            assert app._agent_running is True
+            assert app._interrupt_requested is False
+            assert not turn.done()
+            # No interrupt widget, so nothing pretended the turn had ended.
+            assert rendered(app) == [
+                ("UserMessage", "First"),
+                ("AssistantMessage", "R1"),
+                ("UserMessage", "Second"),
+                ("AssistantMessage", "R2"),
+                ("UserMessage", "/undo"),
+                ("ErrorMessage", BUSY_REFUSAL),
+            ]
+
+            await finish_stalled_turn(app, turn)
+
+        # The transcript the running turn owns is untouched.
+        assert len(agent.messages) == 5
+        assert agent._turn_boundaries == [1, 3]
+
+    @pytest.mark.asyncio
+    async def test_submitting_another_command_still_interrupts_as_before(self) -> None:
+        # Only undo opts out of the interrupt: preserving what every other
+        # command does matters as much as fixing the rewind.
+        agent = await agent_with_turns("First")
+        app = VibeApp(agent_loop=agent)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            turn = start_stalled_turn(app)
+
+            app.post_message(ChatInputContainer.Submitted("/status"))
+            await pilot.pause()
+
+            assert turn.cancelled()
+            assert app._agent_running is False
+            assert [name for name, _ in rendered(app)] == [
+                "UserMessage",
+                "AssistantMessage",
+                "InterruptMessage",
+                "UserMessage",
+                "UserCommandMessage",
+            ]
+
+            await finish_stalled_turn(app, turn)
+
 
 class TestUndoFailuresAreReported:
     @pytest.mark.asyncio
@@ -417,10 +625,98 @@ class TestUndoFailuresAreReported:
             monkeypatch.setattr(app, "_rebuild_history_from_messages", failing_rebuild)
             await app._handle_command("/undo")
 
-            # A failure raised after the area was cleared must still be reported
-            # rather than swallowed, leaving the user with a blank transcript.
+            # Re-rendering is attempted again before reporting, but a failure that
+            # persists cannot be recovered from: what matters is that the user is
+            # told, rather than left with an unexplained blank transcript.
             assert rendered(app) == [
                 ("ErrorMessage", "Failed to undo: rebuild exploded")
             ]
 
         assert len(agent.messages) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failure_before_the_teardown_still_converges_on_the_rewind(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The rewind commits before anything is re-rendered, so a failure in the
+        # very first rendering step would otherwise leave the removed turn on
+        # screen: a transcript the user was told had been rewound.
+        agent = await agent_with_turns("First", "Second")
+        app = VibeApp(agent_loop=agent)
+        attempts: list[int] = []
+        screen_at_failure: list[list[tuple[str, str | None]]] = []
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            render = app._render_rewound_transcript
+
+            async def render_failing_once() -> None:
+                attempts.append(len(attempts))
+                if not attempts[-1]:
+                    screen_at_failure.append(rendered(app))
+                    raise RuntimeError("render exploded")
+                await render()
+
+            monkeypatch.setattr(app, "_render_rewound_transcript", render_failing_once)
+            await app._handle_command("/undo")
+
+            # At the moment of failure the screen still showed the turn the core
+            # had already removed: precisely the divergence to be closed.
+            assert screen_at_failure[0] == [
+                ("UserMessage", "First"),
+                ("AssistantMessage", "R1"),
+                ("UserMessage", "Second"),
+                ("AssistantMessage", "R2"),
+                ("UserMessage", "/undo"),
+            ]
+            # The recovery re-rendered from the truncated message list, so the
+            # undone turn is gone from the screen as well as from the transcript,
+            # and the failure is still reported.
+            assert len(attempts) == 2
+            assert rendered(app) == [
+                ("UserMessage", "First"),
+                ("AssistantMessage", "R1"),
+                ("UserMessage", "/undo"),
+                ("ErrorMessage", "Failed to undo: render exploded"),
+            ]
+
+        assert [message.role for message in agent.messages] == [
+            Role.system,
+            Role.user,
+            Role.assistant,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failure_after_the_teardown_still_converges_on_the_rewind(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The mirror case: the area has already been emptied when the failure
+        # lands, so without a recovery the user would be left staring at nothing.
+        agent = await agent_with_turns("First", "Second")
+        app = VibeApp(agent_loop=agent)
+        attempts: list[int] = []
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            rebuild = app._rebuild_history_from_messages
+
+            async def rebuild_failing_once() -> None:
+                attempts.append(len(attempts))
+                if not attempts[-1]:
+                    raise RuntimeError("rebuild exploded")
+                await rebuild()
+
+            monkeypatch.setattr(
+                app, "_rebuild_history_from_messages", rebuild_failing_once
+            )
+            await app._handle_command("/undo")
+
+            assert len(attempts) == 2
+            assert rendered(app) == [
+                ("UserMessage", "First"),
+                ("AssistantMessage", "R1"),
+                ("UserMessage", "/undo"),
+                ("ErrorMessage", "Failed to undo: rebuild exploded"),
+            ]
+
+        assert len(agent.messages) == 3

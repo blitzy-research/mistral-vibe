@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from enum import StrEnum, auto
 from pathlib import Path
+import re
 import string
 import subprocess
 import time
@@ -95,6 +96,56 @@ from vibe.core.utils import (
 _MARKDOWN_LITERAL_ESCAPES = str.maketrans({
     character: f"\\{character}" for character in string.punctuation
 })
+
+# Escape sequence introducers and invisible direction controls survive Markdown
+# escaping untouched, and the renderer beneath the widgets filters only a handful
+# of C0 codes, so an ESC, CSI, OSC or C1 byte pasted into a prompt would reach the
+# terminal verbatim and a bidirectional override could reorder what the reader
+# sees without changing the text. Deleting them leaves every visible character in
+# place. Tab is deliberately kept, so removing a control never runs words
+# together, and line breaks never reach here because the preview is one line.
+_UNSAFE_CONTROL_CHARACTERS = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]"
+)
+
+# Handlers that must observe a live agent turn rather than have it torn down for
+# them. Submitting any other input interrupts a running turn first, but a command
+# whose handler refuses while the loop is busy has to be dispatched against that
+# busy state: interrupting first would cancel the turn, possibly after a tool has
+# already had an effect, and then let the refusal proceed as if nothing had been
+# running. Identified by handler name because registry dispatch is reflective.
+_IDLE_ONLY_COMMAND_HANDLERS = frozenset({"_undo_last_turn"})
+
+# How much of an undone prompt the confirmation quotes, and the single-pass search
+# that recovers it: the first character that is neither blank nor a line break,
+# followed by at most this many more characters from that same line. One character
+# beyond the budget is enough to tell a line that fits from one that must be
+# truncated, so the work and the memory are bounded no matter how large, how long
+# or how many-lined the prompt was.
+_UNDONE_PROMPT_PREVIEW_LENGTH = 80
+_UNDONE_PROMPT_FIRST_LINE = re.compile(
+    rf"\S[^\r\n]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}}"
+)
+
+
+def _summarize_undone_prompt(content: str) -> str:
+    """Reduce a recovered prompt to one short line that renders literally.
+
+    Returns:
+        The bounded first line of the prompt, stripped of terminal control and
+        direction characters and escaped so a Markdown renderer echoes it exactly,
+        or an empty string when the prompt holds nothing worth quoting
+    """
+    if (first_line := _UNDONE_PROMPT_FIRST_LINE.search(content)) is None:
+        return ""
+
+    preview = _UNSAFE_CONTROL_CHARACTERS.sub("", first_line[0]).rstrip()
+    if len(preview) > _UNDONE_PROMPT_PREVIEW_LENGTH:
+        preview = f"{preview[: _UNDONE_PROMPT_PREVIEW_LENGTH - 1]}…"
+
+    # Escaped last, so the length budget is spent on visible characters rather
+    # than on backslashes the parser consumes.
+    return preview.translate(_MARKDOWN_LITERAL_ESCAPES)
 
 
 class BottomApp(StrEnum):
@@ -268,7 +319,7 @@ class VibeApp(App):  # noqa: PLR0904
         input_widget = self.query_one(ChatInputContainer)
         input_widget.value = ""
 
-        if self._agent_running:
+        if self._agent_running and not self._requires_idle_agent(value):
             await self._interrupt_agent_loop()
 
         if value.startswith("!"):
@@ -397,6 +448,18 @@ class VibeApp(App):  # noqa: PLR0904
         self.agent_loop.set_tool_permission(
             tool_name, ToolPermission.ALWAYS, save_permanently
         )
+
+    def _requires_idle_agent(self, user_input: str) -> bool:
+        """Report whether submitting this input must leave a running turn alone.
+
+        Returns:
+            True when the input resolves to a command whose handler refuses to
+            run while the agent loop is busy, and which therefore has to reach
+            that handler with the turn still running
+        """
+        if command := self.commands.find_command(user_input):
+            return command.handler in _IDLE_ONLY_COMMAND_HANDLERS
+        return False
 
     async def _handle_command(self, user_input: str) -> bool:
         if command := self.commands.find_command(user_input):
@@ -718,7 +781,10 @@ class VibeApp(App):  # noqa: PLR0904
 
     async def _undo_last_turn(self) -> None:
         # Rewinding the transcript underneath a live turn would corrupt the
-        # display, so refuse while the loop is busy, as compaction does.
+        # display, so refuse while the loop is busy, as compaction does. The
+        # submitted input reaches this guard with the turn still running, because
+        # _IDLE_ONLY_COMMAND_HANDLERS keeps the submit path from interrupting on
+        # this command's behalf; without that the guard could never fire.
         if self._agent_running:
             await self._mount_and_scroll(
                 ErrorMessage(
@@ -728,6 +794,7 @@ class VibeApp(App):  # noqa: PLR0904
             )
             return
 
+        undone: str | None = None
         try:
             # Synchronous by design: the rewind is a local list truncation that
             # never contacts the backend and never touches session statistics.
@@ -739,41 +806,62 @@ class VibeApp(App):  # noqa: PLR0904
                 await self._mount_and_scroll(UserCommandMessage("Nothing to undo."))
                 return
 
-            await self._finalize_current_streaming_message()
-            messages_area = self.query_one("#messages")
-            await messages_area.remove_children()
-            # Rebuild while the area is still empty: the routine returns early
-            # when children are present, which is why the echo is re-mounted
-            # after it rather than before, unlike the clear-history flow.
-            await self._rebuild_history_from_messages()
-            await messages_area.mount(UserMessage("/undo"))
+            await self._render_rewound_transcript()
 
-            # Keep the preview to one bounded line so a long or multi-line
-            # prompt cannot flood the confirmation. Surrounding blank space is
-            # dropped so a transcript that was not typed through the input box,
-            # which strips it, still reads as one tidy line. The fixed leading
-            # text keeps the content off the start of the line, so a leading "#"
-            # cannot be rendered as a heading by the widget's Markdown child.
-            # Truncate before escaping so the budget is spent on visible
-            # characters, then escape so the widget's Markdown child echoes the
-            # undone prompt exactly as the user typed it, matching how the user
-            # message itself renders through NoMarkupStatic.
-            max_summary_length = 80
-            summary = next(iter(undone.strip().splitlines()), "").strip()
-            if len(summary) > max_summary_length:
-                summary = f"{summary[: max_summary_length - 1]}…"
-            literal_summary = summary.translate(_MARKDOWN_LITERAL_ESCAPES)
+            # The preview is one bounded, control-free line, so a prompt of any
+            # size cannot flood the confirmation or smuggle an escape sequence
+            # into it. The fixed leading text keeps that content off the start of
+            # the line, so a leading "#" cannot be rendered as a heading by the
+            # widget's Markdown child, and a prompt worth quoting nothing at all
+            # confirms without a trailing colon phrase.
+            preview = _summarize_undone_prompt(undone)
             await self._mount_and_scroll(
                 UserCommandMessage(
-                    f"Undid last turn: {literal_summary}"
-                    if literal_summary
-                    else "Undid last turn."
+                    f"Undid last turn: {preview}" if preview else "Undid last turn."
                 )
             )
 
         except Exception as e:
+            # The rewind is already committed by the time anything above it can
+            # fail, so the screen would otherwise be left disagreeing with the
+            # transcript: still showing the removed turn, or blank because it was
+            # cleared and never rebuilt. Bring it back onto the message list
+            # before reporting, and report either way.
+            if undone is not None:
+                await self._recover_rewound_transcript()
             await self._mount_and_scroll(
                 ErrorMessage(f"Failed to undo: {e}", collapsed=self._tools_collapsed)
+            )
+
+    async def _render_rewound_transcript(self) -> None:
+        """Render the message area from the transcript a rewind left behind.
+
+        Any streaming widget is closed out before the area is emptied, so none is
+        orphaned by the removal, and the surviving transcript is rebuilt while the
+        area is still empty, because the rebuild routine returns early whenever
+        children are present. Only then is the command echo restored, which is the
+        one way this ordering differs from the clear-history flow.
+        """
+        await self._finalize_current_streaming_message()
+        messages_area = self.query_one("#messages")
+        await messages_area.remove_children()
+        await self._rebuild_history_from_messages()
+        await messages_area.mount(UserMessage("/undo"))
+
+    async def _recover_rewound_transcript(self) -> None:
+        """Re-render the message area once after a rewind failed to display.
+
+        The message list is authoritative and has already been truncated, so the
+        same render is simply attempted again. A recovery that fails in turn is
+        recorded rather than raised, because the failure that prompted it is the
+        one the user needs to be told about.
+        """
+        try:
+            await self._render_rewound_transcript()
+        except Exception as recovery_failure:
+            logger.debug(
+                "Failed to re-render the transcript after undo",
+                exc_info=recovery_failure,
             )
 
     async def _show_log_path(self) -> None:

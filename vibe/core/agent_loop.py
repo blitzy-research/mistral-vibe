@@ -860,6 +860,11 @@ class AgentLoop:
         statistics are deliberately left untouched so they behave as they do
         across a reload, and no backend is contacted.
 
+        The session log is left exactly as written: the undone turn keeps the
+        records it already has, and because the logger appends only what the
+        transcript holds beyond the count it last persisted, a turn that refills
+        the rewound span is absent from that log while later turns are not.
+
         Returns:
             The content of the removed user message, or None when there is no
             recorded turn left to undo
