@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from enum import StrEnum, auto
 from pathlib import Path
+import string
 import subprocess
 import time
 from typing import Any, ClassVar, assert_never, cast
@@ -85,6 +86,15 @@ from vibe.core.utils import (
     is_dangerous_directory,
     logger,
 )
+
+# Backslash escapes for every ASCII punctuation character, which is exactly the
+# set CommonMark defines them for. Interpolating user text into a widget that
+# renders Markdown would otherwise let that text style itself, so translating it
+# through this table keeps it literal while leaving what the reader sees
+# unchanged: the escapes are consumed by the parser, not displayed.
+_MARKDOWN_LITERAL_ESCAPES = str.maketrans({
+    character: f"\\{character}" for character in string.punctuation
+})
 
 
 class BottomApp(StrEnum):
@@ -742,12 +752,17 @@ class VibeApp(App):  # noqa: PLR0904
             # prompt cannot flood the confirmation. The fixed leading text also
             # keeps the content off the start of the line, so a leading "#"
             # cannot be rendered as a heading by the widget's Markdown child.
+            # Truncate before escaping so the budget is spent on visible
+            # characters, then escape so the widget's Markdown child echoes the
+            # undone prompt exactly as the user typed it, matching how the user
+            # message itself renders through NoMarkupStatic.
             max_summary_length = 80
             summary = next(iter(undone.splitlines()), "")
             if len(summary) > max_summary_length:
                 summary = f"{summary[: max_summary_length - 1]}…"
+            literal_summary = summary.translate(_MARKDOWN_LITERAL_ESCAPES)
             await self._mount_and_scroll(
-                UserCommandMessage(f"Undid last turn: {summary}")
+                UserCommandMessage(f"Undid last turn: {literal_summary}")
             )
 
         except Exception as e:
