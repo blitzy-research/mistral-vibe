@@ -116,15 +116,20 @@ _UNSAFE_CONTROL_CHARACTERS = re.compile(
 # running. Identified by handler name because registry dispatch is reflective.
 _IDLE_ONLY_COMMAND_HANDLERS = frozenset({"_undo_last_turn"})
 
-# How much of an undone prompt the confirmation quotes, and the single-pass search
-# that recovers it: the first character that is neither blank nor a line break,
-# followed by at most this many more characters from that same line. One character
-# beyond the budget is enough to tell a line that fits from one that must be
-# truncated, so the work and the memory are bounded no matter how large, how long
-# or how many-lined the prompt was.
+# How much of an undone prompt the confirmation quotes, and the single-pass match
+# that recovers it: blanks that indent the first line, then the first character
+# that is neither blank nor a line break, then at most this many more characters
+# from that same line. One character beyond the budget is enough to tell a line
+# that fits from one that must be truncated, and the leading run is bounded too,
+# so the work and the memory stay bounded no matter how large, how long or how
+# many-lined the prompt was. The pattern is applied from position 0 only and
+# neither part can cross a line break, which is what confines the preview to the
+# first line: a prompt that opens with a blank line quotes nothing at all rather
+# than reaching down the transcript for the next line that happens to have text.
 _UNDONE_PROMPT_PREVIEW_LENGTH = 80
 _UNDONE_PROMPT_FIRST_LINE = re.compile(
-    rf"\S[^\r\n]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}}"
+    rf"[^\S\r\n]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}}"
+    rf"(\S[^\r\n]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}})"
 )
 
 
@@ -134,12 +139,12 @@ def _summarize_undone_prompt(content: str) -> str:
     Returns:
         The bounded first line of the prompt, stripped of terminal control and
         direction characters and escaped so a Markdown renderer echoes it exactly,
-        or an empty string when the prompt holds nothing worth quoting
+        or an empty string when the first line holds nothing worth quoting
     """
-    if (first_line := _UNDONE_PROMPT_FIRST_LINE.search(content)) is None:
+    if (first_line := _UNDONE_PROMPT_FIRST_LINE.match(content)) is None:
         return ""
 
-    preview = _UNSAFE_CONTROL_CHARACTERS.sub("", first_line[0]).rstrip()
+    preview = _UNSAFE_CONTROL_CHARACTERS.sub("", first_line[1]).rstrip()
     if len(preview) > _UNDONE_PROMPT_PREVIEW_LENGTH:
         preview = f"{preview[: _UNDONE_PROMPT_PREVIEW_LENGTH - 1]}…"
 
@@ -463,7 +468,17 @@ class VibeApp(App):  # noqa: PLR0904
 
     async def _handle_command(self, user_input: str) -> bool:
         if command := self.commands.find_command(user_input):
-            await self._mount_and_scroll(UserMessage(user_input))
+            # An idle-only command is the one kind that can be echoed while a
+            # turn is still streaming, because the submit path deliberately does
+            # not interrupt on its behalf. Closing the stream out to make room for
+            # that echo would leave the next chunk to open a second assistant
+            # widget, splitting one reply in two and making the view disagree with
+            # the single assistant message the transcript holds, so the open
+            # widget is kept and the echo simply lands beneath it.
+            await self._mount_and_scroll(
+                UserMessage(user_input),
+                preserve_stream=command.handler in _IDLE_ONLY_COMMAND_HANDLERS,
+            )
             handler = getattr(self, command.handler)
             if asyncio.iscoroutinefunction(handler):
                 await handler()
@@ -786,11 +801,16 @@ class VibeApp(App):  # noqa: PLR0904
         # _IDLE_ONLY_COMMAND_HANDLERS keeps the submit path from interrupting on
         # this command's behalf; without that the guard could never fire.
         if self._agent_running:
+            # The refusal is mounted beneath a turn that is still streaming, so it
+            # must leave that stream open for exactly the reason the echo does:
+            # a refused rewind changes nothing, and it must not split the reply
+            # arriving around it across two assistant widgets either.
             await self._mount_and_scroll(
                 ErrorMessage(
                     "Cannot undo while agent loop is processing. Please wait.",
                     collapsed=self._tools_collapsed,
-                )
+                ),
+                preserve_stream=True,
             )
             return
 
@@ -1226,7 +1246,9 @@ class VibeApp(App):  # noqa: PLR0904
         await widget.write_initial_content()
         return widget
 
-    async def _mount_and_scroll(self, widget: Widget) -> None:
+    async def _mount_and_scroll(
+        self, widget: Widget, *, preserve_stream: bool = False
+    ) -> None:
         messages_area = self.query_one("#messages")
         chat = self.query_one("#chat", VerticalScroll)
         was_at_bottom = self._is_scrolled_to_bottom(chat)
@@ -1257,7 +1279,13 @@ class VibeApp(App):  # noqa: PLR0904
                 self._current_streaming_message = result
             self._current_streaming_reasoning = None
         else:
-            await self._finalize_current_streaming_message()
+            # Anything that is not itself part of a stream normally closes the open
+            # stream out, because it is arriving after the model finished. A caller
+            # that knows better - one mounting beneath a turn that is still running
+            # - asks for the stream to be preserved, so the widget the next chunk
+            # belongs to stays open and that reply is not split in two.
+            if not preserve_stream:
+                await self._finalize_current_streaming_message()
             await messages_area.mount(widget)
 
             is_tool_message = isinstance(widget, (ToolCallMessage, ToolResultMessage))
