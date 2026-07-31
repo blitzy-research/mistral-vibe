@@ -706,6 +706,55 @@ class VibeApp(App):  # noqa: PLR0904
                 )
             )
 
+    async def _undo_last_turn(self) -> None:
+        # Rewinding the transcript underneath a live turn would corrupt the
+        # display, so refuse while the loop is busy, as compaction does.
+        if self._agent_running:
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Cannot undo while agent loop is processing. Please wait.",
+                    collapsed=self._tools_collapsed,
+                )
+            )
+            return
+
+        try:
+            # Synchronous by design: the rewind is a local list truncation that
+            # never contacts the backend and never touches session statistics.
+            undone = self.agent_loop.undo_last_turn()
+            if undone is None:
+                # A no-op must destroy nothing on screen, so report and return
+                # before any teardown: the command echo already mounted by
+                # _handle_command survives untouched.
+                await self._mount_and_scroll(UserCommandMessage("Nothing to undo."))
+                return
+
+            await self._finalize_current_streaming_message()
+            messages_area = self.query_one("#messages")
+            await messages_area.remove_children()
+            # Rebuild while the area is still empty: the routine returns early
+            # when children are present, which is why the echo is re-mounted
+            # after it rather than before, unlike the clear-history flow.
+            await self._rebuild_history_from_messages()
+            await messages_area.mount(UserMessage("/undo"))
+
+            # Keep the preview to one bounded line so a long or multi-line
+            # prompt cannot flood the confirmation. The fixed leading text also
+            # keeps the content off the start of the line, so a leading "#"
+            # cannot be rendered as a heading by the widget's Markdown child.
+            max_summary_length = 80
+            summary = next(iter(undone.splitlines()), "")
+            if len(summary) > max_summary_length:
+                summary = f"{summary[: max_summary_length - 1]}…"
+            await self._mount_and_scroll(
+                UserCommandMessage(f"Undid last turn: {summary}")
+            )
+
+        except Exception as e:
+            await self._mount_and_scroll(
+                ErrorMessage(f"Failed to undo: {e}", collapsed=self._tools_collapsed)
+            )
+
     async def _show_log_path(self) -> None:
         if not self.agent_loop.session_logger.enabled:
             await self._mount_and_scroll(
