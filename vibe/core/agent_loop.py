@@ -865,6 +865,10 @@ class AgentLoop:
         transcript holds beyond the count it last persisted, a turn that refills
         the rewound span is absent from that log while later turns are not.
 
+        Tool calls are removed only from the transcript; any side effect they
+        already produced is not reversed. The context-token gauge is not
+        recomputed either, so it can remain stale until the next real turn.
+
         Returns:
             The content of the removed user message, or None when there is no
             recorded turn left to undo
@@ -890,7 +894,6 @@ class AgentLoop:
             if (boundary := self._turn_boundaries.pop()) >= len(self.messages):
                 continue
 
-            # Capture the content first: the slice below discards that message.
             removed_content = self.messages[boundary].content
             self.messages = self.messages[:boundary]
 

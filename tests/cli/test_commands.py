@@ -24,9 +24,8 @@ def test_undo_command_is_registered() -> None:
 
     command = registry.find_command(UNDO_ALIAS)
 
-    # The registered handler names the Textual application coroutine, which is
-    # resolved reflectively with getattr, so nothing but this assertion guards
-    # its spelling: the leading underscore is deliberate and load-bearing.
+    # The handler name is resolved reflectively at runtime; this assertion pins
+    # the registry value, whose leading underscore is deliberate.
     assert command is not None
     assert command.handler == UNDO_HANDLER
     assert command.description == UNDO_DESCRIPTION
@@ -37,8 +36,6 @@ def test_undo_command_is_registered() -> None:
 def test_help_text_lists_undo_command() -> None:
     help_text = CommandRegistry().get_help_text()
 
-    # Asserted against the rendered output rather than a re-implementation of
-    # the renderer, so the help section stays covered by the real formatting.
     assert f"- `{UNDO_ALIAS}`: {UNDO_DESCRIPTION}" in help_text
 
 
@@ -63,10 +60,8 @@ def test_registry_keeps_existing_commands_alongside_undo() -> None:
     clear_command = registry.find_command("/clear")
     compact_command = registry.find_command("/compact")
 
-    # Nine pre-existing commands plus /undo. The two history-mutating siblings
-    # are spot-checked because they are the commands the rewind interacts with,
-    # and /exit is spot-checked because it is the only command that still ends
-    # the session, which registering a tenth command must not have changed.
+    # The registry retains the full command set; clear and compact are the
+    # history-operation siblings, while exit remains the sole exiting command.
     assert frozenset(registry.commands) == REGISTERED_COMMAND_NAMES
     assert len(registry.commands) == len(REGISTERED_COMMAND_NAMES)
     assert clear_command is not None

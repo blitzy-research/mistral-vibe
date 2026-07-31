@@ -137,9 +137,10 @@ def _summarize_undone_prompt(content: str) -> str:
     """Reduce a recovered prompt to one short line that renders literally.
 
     Returns:
-        The bounded first line of the prompt, stripped of terminal control and
-        direction characters and escaped so a Markdown renderer echoes it exactly,
-        or an empty string when the first line holds nothing worth quoting
+        A bounded prefix of the prompt's first line with the selected escape, C1,
+        zero-width and direction controls removed and every ASCII punctuation
+        character escaped so a Markdown renderer echoes it exactly, or an empty
+        string when no nonblank character appears within that bounded prefix
     """
     if (first_line := _UNDONE_PROMPT_FIRST_LINE.match(content)) is None:
         return ""
@@ -828,12 +829,12 @@ class VibeApp(App):  # noqa: PLR0904
 
             await self._render_rewound_transcript()
 
-            # The preview is one bounded, control-free line, so a prompt of any
-            # size cannot flood the confirmation or smuggle an escape sequence
-            # into it. The fixed leading text keeps that content off the start of
-            # the line, so a leading "#" cannot be rendered as a heading by the
-            # widget's Markdown child, and a prompt worth quoting nothing at all
-            # confirms without a trailing colon phrase.
+            # The preview is one bounded, sanitized line, so a prompt of any size
+            # cannot flood the confirmation or smuggle an escape sequence into it.
+            # The fixed leading text keeps that content off the start of the line,
+            # so a leading "#" cannot be rendered as a heading by the widget's
+            # Markdown child, and a prompt with nothing worth quoting confirms
+            # without a trailing colon phrase.
             preview = _summarize_undone_prompt(undone)
             await self._mount_and_scroll(
                 UserCommandMessage(

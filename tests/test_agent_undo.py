@@ -1,12 +1,4 @@
-"""Coverage for the conversation rewind and for the `/undo` command driving it.
-
-Both halves of one feature live here: the synchronous rewind on `AgentLoop`, and
-the terminal interface command surface that calls it. They share a module because
-the feature owns two test modules and the sibling `tests/cli/test_commands.py` is
-contractually free of any user interface, which leaves this the only home for the
-interface scenarios. The halves stay apart by section - every core scenario comes
-first, every interface scenario after the divider that introduces them.
-"""
+"""Tests for AgentLoop conversation rewinds and the /undo terminal command."""
 
 from __future__ import annotations
 
@@ -306,7 +298,7 @@ class TestUndoRewindsOneTurn:
 class TestUndoRemovesTheWholeTurnTail:
     """A rewind must discard everything the turn appended, not a fixed tail.
 
-    A tool-bearing turn appends four messages rather than two: the user message,
+    This single-tool turn appends four messages rather than two: the user message,
     the assistant message carrying the tool call, the tool response, and the
     assistant reply that follows it. Truncating back to the recorded boundary
     removes all four; dropping a fixed two-message tail would strand the
@@ -371,7 +363,6 @@ class TestUndoRemovesTheWholeTurnTail:
 
         assert removed == "Read my todos"
         assert len(agent.messages) == 3
-        # No fragment of the tool-bearing turn survives anywhere in the history.
         assert all(message.role != Role.tool for message in agent.messages)
         assert all(message.tool_calls is None for message in agent.messages)
         assert agent._turn_boundaries == [1]
@@ -506,8 +497,6 @@ class TestUndoAfterHistoryReset:
 
         assert len(agent.messages) == 1
 
-        # clear_history removes every recorded boundary, so undo must be a local
-        # no-op that preserves the remaining system message.
         with no_backend_contact(backend), unchanged_transcript(agent):
             assert agent.undo_last_turn() is None
 
@@ -595,7 +584,6 @@ class TestUndoDiscardsStaleBoundaries:
         async for _ in agent.act("Second"):
             pass
 
-        # Leave both recorded boundaries out of range for the truncated list.
         agent.messages = agent.messages[:1]
 
         with no_backend_contact(backend), unchanged_transcript(agent):
@@ -659,7 +647,6 @@ class TestUndoIsRefusedWhileTheHistoryIsClaimed:
         with pytest.raises(AgentLoopStateError):
             agent.undo_last_turn()
 
-        # Nothing was popped and nothing was truncated.
         assert len(agent.messages) == 2
         assert agent._turn_boundaries == [1]
 
@@ -677,7 +664,6 @@ class TestUndoIsRefusedWhileTheHistoryIsClaimed:
         ]
         assert agent.messages[2].content == "R1"
 
-        # Once the turn has released the transcript the same rewind succeeds.
         assert agent.undo_last_turn() == "Sensitive request"
         assert len(agent.messages) == 1
 
@@ -788,16 +774,12 @@ class TestUndoIsRefusedWhileTheHistoryIsClaimed:
         with pytest.raises(AgentLoopStateError):
             agent.undo_last_turn()
 
-        # The refusal popped no boundary and truncated nothing, so the clear
-        # still owns exactly the transcript it saved.
         assert len(agent.messages) == 3
         assert agent._turn_boundaries == [1]
 
         release.set()
         await clearing
 
-        # The clear then completes normally and drops what it invalidated, so
-        # the rewind that was refused is now a no-op rather than a rewind.
         assert len(agent.messages) == 1
         assert agent.messages[0].role == Role.system
         assert agent._turn_boundaries == []
@@ -866,15 +848,9 @@ class TestUndoLeavesTheWrittenSessionLogAlone:
         async for _ in agent.act("Second again"):
             pass
 
-        # Pinned deliberately rather than fixed. The logger appends whatever the
-        # transcript holds beyond the count it last persisted
-        # (vibe/core/session/session_logger.py), and a rewind lowers that count
-        # without touching what was written, so a turn refilling the rewound span
-        # sits inside the already-persisted range and is not appended. Undo
-        # neither rewrites the log nor rolls the session over the way /clear and
-        # /compact do, because it rewinds the transcript rather than discarding
-        # the session. Revisit this assertion with the logger if its cursoring
-        # ever becomes identity-based.
+        # The logger appends from the count it last persisted, and a rewind moves
+        # neither that cursor nor the records already written, so a turn refilling
+        # the rewound span sits inside the persisted range and is omitted.
         refilled = read_session_log(save_dir)
         assert refilled.logged == persisted_first_two_turns()
         assert refilled.cursor == 4
@@ -892,18 +868,7 @@ class TestUndoLeavesTheWrittenSessionLogAlone:
         assert all("again" not in content for _, content in resumed.logged)
 
 
-# ---------------------------------------------------------------------------
-# Terminal interface scenarios.
-#
-# The handler is reached reflectively through the command registry, so nothing
-# checks its name until a user types the command, and its teardown order is
-# load-bearing: the streaming widget has to be finalized before the message area
-# is emptied, and the surviving transcript has to be rebuilt before the command
-# echo is re-mounted, because the rebuild returns early whenever the area still
-# has children. None of that is visible to a type checker, so every scenario
-# below drives the real application over the same stubbed backend and asserts on
-# the widgets actually mounted, in the order they were mounted.
-# ---------------------------------------------------------------------------
+# Terminal interface scenarios
 
 BUSY_REFUSAL = "Cannot undo while agent loop is processing. Please wait."
 # Long enough that the stand-in turn is still pending when the assertions run,
@@ -1146,8 +1111,6 @@ class TestUndoRendersTheRewoundTranscript:
 
             await app._undo_last_turn()
 
-            # The handler finalized while every widget was still mounted, so no
-            # streaming widget is orphaned by the removal that follows.
             assert children_when_finalized[0] == populated
             assert app._current_streaming_message is None
             assert rendered(app) == [
@@ -1190,8 +1153,6 @@ class TestUndoConfirmationSummary:
                 "UserCommandMessage",
                 f"Undid last turn: {LONG_REQUEST_SUMMARY}",
             )
-            # The budget is spent on visible characters, so exactly one ellipsis
-            # closes the line and the discarded tail never reaches the widget.
             assert LONG_REQUEST_SUMMARY.count("…") == 1
             assert "ery retry." not in LONG_REQUEST_SUMMARY
 
@@ -1218,8 +1179,6 @@ class TestUndoConfirmationSummary:
 
     @pytest.mark.asyncio
     async def test_a_blank_first_line_confirms_without_a_summary(self) -> None:
-        # A rewindable turn whose content is only blank space has nothing worth
-        # previewing, so the confirmation must not trail an empty colon phrase.
         agent = await agent_with_turns("   \n  ")
         app = VibeApp(agent_loop=agent)
 
@@ -1242,8 +1201,6 @@ class TestUndoConfirmationSummary:
         async with app.run_test() as pilot:
             await pilot.pause()
 
-            # The prompt whose first line is empty, then the one that opens with
-            # two line breaks: neither quotes the text waiting further down.
             await app._handle_command("/undo")
 
             assert rendered(app)[-1] == ("UserCommandMessage", "Undid last turn.")
@@ -1254,11 +1211,13 @@ class TestUndoConfirmationSummary:
 
 
 class TestUndoConfirmationIsSafeToRender:
-    """The confirmation quotes recovered text, so it must be inert and bounded.
+    """The confirmation quotes recovered text, so its preview stays bounded.
 
     The quoted prompt reaches a widget that renders Markdown and is ultimately
-    written to a terminal, and it can be arbitrarily large and arbitrarily
-    hostile: pasted, restored from a session or supplied by an embedder.
+    written to a terminal, and it can be large: pasted, restored from a session or
+    supplied by an embedder. The fixtures below carry the escape introducers, C1
+    codes, zero-width characters and direction controls the preview removes, plus
+    prompts of a line count no preview may walk.
     """
 
     @pytest.mark.asyncio
@@ -1289,9 +1248,9 @@ class TestUndoConfirmationIsSafeToRender:
             confirmation = rendered(app)[-1][1]
 
             assert confirmation is not None
-            # Nothing in the Unicode control or format categories is left, which
-            # covers every escape introducer, the C1 range and the bidirectional
-            # and zero-width characters, whatever their combination.
+            # Every escape introducer, C1 code, bidirectional isolate and
+            # zero-width character this prompt carries is in the removed set, so
+            # none of them survives into a control or format category here.
             assert not [
                 character
                 for character in confirmation
@@ -1424,7 +1383,6 @@ class TestUndoIsRefusedWhileTheAgentIsRunning:
             # must not start with that word itself.
             assert not refusal._error.startswith("Error")
 
-        # The refusal is a message, not a rewind.
         assert len(agent.messages) == 5
         assert agent._turn_boundaries == [1, 3]
 
@@ -1472,14 +1430,13 @@ class TestUndoIsRefusedWhileTheAgentIsRunning:
 
             await finish_stalled_turn(app, turn)
 
-        # The transcript the running turn owns is untouched.
         assert len(agent.messages) == 5
         assert agent._turn_boundaries == [1, 3]
 
     @pytest.mark.asyncio
     async def test_submitting_another_command_still_interrupts_as_before(self) -> None:
-        # Only undo opts out of the interrupt: preserving what every other command
-        # does matters as much as fixing the rewind.
+        # Only /undo bypasses the interrupt; every other command retains the
+        # default interrupt behavior.
         agent = await agent_with_turns("First")
         app = VibeApp(agent_loop=agent)
 
@@ -1530,8 +1487,6 @@ class TestUndoMountsWithoutSplittingALiveReply:
             app._agent_running = True
             await app._handle_command("/undo")
 
-            # Both the echo and the refusal landed beneath the reply, and the reply
-            # is still the widget the stream belongs to.
             assert app._current_streaming_message is streaming
             assert [name for name, _ in rendered(app)] == [
                 "UserMessage",
@@ -1543,8 +1498,6 @@ class TestUndoMountsWithoutSplittingALiveReply:
 
             await app._mount_and_scroll(AssistantMessage("chunk two"))
 
-            # The next chunk continued in that same widget rather than opening
-            # another one, so the reply is still a single message on screen.
             assert app._current_streaming_message is streaming
             assert [name for name, _ in rendered(app)] == [
                 "UserMessage",
@@ -1556,8 +1509,8 @@ class TestUndoMountsWithoutSplittingALiveReply:
 
     @pytest.mark.asyncio
     async def test_an_ordinary_mount_still_closes_the_open_reply(self) -> None:
-        # The opt-out is asked for by name, so the default has to be unchanged:
-        # anything else mounted mid-stream finalizes it exactly as it always did.
+        # The preserve-stream behavior is opt-in; ordinary mounts still finalize
+        # the current stream.
         agent = await agent_with_turns("First")
         app = VibeApp(agent_loop=agent)
 
@@ -1575,7 +1528,6 @@ class TestUndoMountsWithoutSplittingALiveReply:
 
             await app._mount_and_scroll(AssistantMessage("a new reply"))
 
-            # The closed widget was left behind and the chunk opened a second one.
             assert app._current_streaming_message is not None
             assert app._current_streaming_message is not streaming
             assert [name for name, _ in rendered(app)] == [
@@ -1604,7 +1556,6 @@ class TestUndoFailuresAreReported:
             monkeypatch.setattr(agent, "undo_last_turn", failing_rewind)
             await app._handle_command("/undo")
 
-            # The failure is surfaced and nothing was torn down.
             assert rendered(app) == [
                 ("UserMessage", "First"),
                 ("AssistantMessage", "R1"),
@@ -1672,9 +1623,6 @@ class TestUndoFailuresAreReported:
                 ("AssistantMessage", "R2"),
                 ("UserMessage", "/undo"),
             ]
-            # The recovery re-rendered from the truncated message list, so the
-            # undone turn is gone from the screen as well as from the transcript,
-            # and the failure is still reported.
             assert len(attempts) == 2
             assert rendered(app) == [
                 ("UserMessage", "First"),
