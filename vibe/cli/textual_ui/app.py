@@ -749,20 +749,26 @@ class VibeApp(App):  # noqa: PLR0904
             await messages_area.mount(UserMessage("/undo"))
 
             # Keep the preview to one bounded line so a long or multi-line
-            # prompt cannot flood the confirmation. The fixed leading text also
-            # keeps the content off the start of the line, so a leading "#"
+            # prompt cannot flood the confirmation. Surrounding blank space is
+            # dropped so a transcript that was not typed through the input box,
+            # which strips it, still reads as one tidy line. The fixed leading
+            # text keeps the content off the start of the line, so a leading "#"
             # cannot be rendered as a heading by the widget's Markdown child.
             # Truncate before escaping so the budget is spent on visible
             # characters, then escape so the widget's Markdown child echoes the
             # undone prompt exactly as the user typed it, matching how the user
             # message itself renders through NoMarkupStatic.
             max_summary_length = 80
-            summary = next(iter(undone.splitlines()), "")
+            summary = next(iter(undone.strip().splitlines()), "").strip()
             if len(summary) > max_summary_length:
                 summary = f"{summary[: max_summary_length - 1]}…"
             literal_summary = summary.translate(_MARKDOWN_LITERAL_ESCAPES)
             await self._mount_and_scroll(
-                UserCommandMessage(f"Undid last turn: {literal_summary}")
+                UserCommandMessage(
+                    f"Undid last turn: {literal_summary}"
+                    if literal_summary
+                    else "Undid last turn."
+                )
             )
 
         except Exception as e:

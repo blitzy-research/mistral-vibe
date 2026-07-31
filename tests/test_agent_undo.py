@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import NamedTuple
@@ -9,6 +10,7 @@ import pytest
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from vibe.core.agent_loop import AgentLoop, AgentLoopStateError
+from vibe.core.agents.models import BuiltinAgentName
 from vibe.core.config import (
     Backend,
     ModelConfig,
@@ -16,18 +18,31 @@ from vibe.core.config import (
     SessionLoggingConfig,
     VibeConfig,
 )
-from vibe.core.types import AssistantEvent, LLMMessage, Role, UserMessageEvent
+from vibe.core.tools.base import BaseToolConfig, ToolPermission
+from vibe.core.types import (
+    AssistantEvent,
+    FunctionCall,
+    LLMMessage,
+    Role,
+    ToolCall,
+    UserMessageEvent,
+)
 
 SENTINEL_RESPONSE = "sentinel response: a rewind must never consume this stream"
 
 
 def make_config(
-    *, system_prompt_id: str = "tests", active_model: str = "devstral-latest"
+    *,
+    system_prompt_id: str = "tests",
+    active_model: str = "devstral-latest",
+    enabled_tools: list[str] | None = None,
+    tools: dict[str, BaseToolConfig] | None = None,
 ) -> VibeConfig:
     """Build a hermetic configuration for the stubbed undo scenarios.
 
     Session logging and auto-compaction are both off so nothing rewrites the
-    transcript mid-test, and no tool is enabled so each turn is two messages.
+    transcript mid-test, and no tool is enabled unless a scenario asks for one,
+    so every other turn appends exactly two messages.
     """
     models = [
         ModelConfig(
@@ -55,7 +70,8 @@ def make_config(
         active_model=active_model,
         models=models,
         providers=providers,
-        enabled_tools=[],
+        enabled_tools=enabled_tools or [],
+        tools=tools or {},
     )
 
 
@@ -211,6 +227,92 @@ class TestUndoRewindsOneTurn:
         assert_system_message_intact(agent, system_message, system_values)
 
 
+class TestUndoRemovesTheWholeTurnTail:
+    """A rewind must discard everything the turn appended, not a fixed tail.
+
+    A tool-bearing turn appends four messages rather than two: the user message,
+    the assistant message carrying the tool call, the tool response, and the
+    assistant reply that follows it. Truncating back to the recorded boundary
+    removes all four; dropping a fixed two-message tail would strand the
+    assistant tool call and its tool response in the transcript.
+    """
+
+    @pytest.mark.asyncio
+    async def test_undo_removes_the_tool_call_and_tool_response_tail(self) -> None:
+        tool_call = ToolCall(
+            id="call_undo",
+            index=0,
+            function=FunctionCall(name="todo", arguments='{"action": "read"}'),
+        )
+        # The fourth stream is the sentinel: an unscripted completion consumes it
+        # instead of the stub quietly serving an empty assistant message.
+        backend = FakeBackend([
+            [mock_llm_chunk(content="R1")],
+            [mock_llm_chunk(content="Checking your todos.", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="You have no todos.")],
+            [mock_llm_chunk(content=SENTINEL_RESPONSE)],
+        ])
+        agent = AgentLoop(
+            make_config(
+                enabled_tools=["todo"],
+                tools={"todo": BaseToolConfig(permission=ToolPermission.ALWAYS)},
+            ),
+            agent_name=BuiltinAgentName.AUTO_APPROVE,
+            backend=backend,
+        )
+        system_message, system_values = capture_system_message(agent)
+
+        async for _ in agent.act("First"):
+            pass
+
+        assert len(agent.messages) == 3
+        turn_one_objects = list(agent.messages[1:])
+        turn_one_values = [
+            message.model_copy(deep=True) for message in agent.messages[1:]
+        ]
+
+        async for _ in agent.act("Read my todos"):
+            pass
+
+        # The tool-bearing turn really did append a four-message tail, so the
+        # assertions below are not vacuous.
+        assert [message.role for message in agent.messages] == [
+            Role.system,
+            Role.user,
+            Role.assistant,
+            Role.user,
+            Role.assistant,
+            Role.tool,
+            Role.assistant,
+        ]
+        assert agent.messages[4].tool_calls is not None
+        assert agent.messages[5].tool_call_id == "call_undo"
+        assert agent.messages[5].name == "todo"
+        assert agent._turn_boundaries == [1, 3]
+
+        with no_backend_contact(backend):
+            removed = agent.undo_last_turn()
+
+        assert removed == "Read my todos"
+        assert len(agent.messages) == 3
+        # No fragment of the tool-bearing turn survives anywhere in the history.
+        assert all(message.role != Role.tool for message in agent.messages)
+        assert all(message.tool_calls is None for message in agent.messages)
+        assert agent._turn_boundaries == [1]
+
+        # The preserved turn is the very same message objects, unmodified.
+        assert_system_message_intact(agent, system_message, system_values)
+        assert all(
+            surviving is original
+            for surviving, original in zip(
+                agent.messages[1:], turn_one_objects, strict=True
+            )
+        )
+        assert agent.messages[1:] == turn_one_values
+        assert agent.messages[1].content == "First"
+        assert agent.messages[2].content == "R1"
+
+
 class TestUndoPreservesCumulativeStats:
     @pytest.mark.asyncio
     async def test_cumulative_session_stats_survive_every_undo(self) -> None:
@@ -244,6 +346,55 @@ class TestUndoPreservesCumulativeStats:
             assert agent.stats.session_total_llm_tokens == total_llm_tokens
             assert agent.stats.session_cost == session_cost
             assert agent.stats.steps == steps
+
+
+class TestUndoKeepsTheMessageObserverInStep:
+    """Truncation must pull the observed-message index back with it.
+
+    The flush routine returns early once that index reaches the length of the
+    message list, so a rewind that left it pointing past the new end would make
+    every later message invisible to programmatic and Agent Client Protocol
+    embedders, which are the consumers that supply an observer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_messages_appended_after_a_rewind_are_still_observed(self) -> None:
+        observed: list[tuple[Role, str | None]] = []
+
+        def observer(message: LLMMessage) -> None:
+            observed.append((message.role, message.content))
+
+        backend = backend_with_sentinel("R1", "R2", "R3")
+        agent = AgentLoop(make_config(), message_observer=observer, backend=backend)
+
+        async for _ in agent.act("First"):
+            pass
+        async for _ in agent.act("Second"):
+            pass
+
+        assert observed == [
+            (Role.system, agent.messages[0].content),
+            (Role.user, "First"),
+            (Role.assistant, "R1"),
+            (Role.user, "Second"),
+            (Role.assistant, "R2"),
+        ]
+        assert agent._last_observed_message_index == len(agent.messages) == 5
+
+        with no_backend_contact(backend):
+            assert agent.undo_last_turn() == "Second"
+
+        assert agent._last_observed_message_index == len(agent.messages) == 3
+
+        observed.clear()
+
+        async for _ in agent.act("Third"):
+            pass
+
+        # Each replacement message is observed exactly once, and the index has
+        # caught up with the transcript again.
+        assert observed == [(Role.user, "Third"), (Role.assistant, "R3")]
+        assert agent._last_observed_message_index == len(agent.messages) == 5
 
 
 class TestUndoAfterHistoryReset:
@@ -530,6 +681,51 @@ class TestUndoIsRefusedWhileTheHistoryIsClaimed:
         assert counted == [2]
         assert [msg.role for msg in agent.messages] == [Role.system, Role.user]
         assert agent.messages[1].content == "<summary>"
+
+    @pytest.mark.asyncio
+    async def test_undo_is_refused_while_a_clear_is_in_flight(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        saving = asyncio.Event()
+        release = asyncio.Event()
+
+        async def suspended_save(*_: object) -> None:
+            saving.set()
+            await release.wait()
+
+        backend = backend_with_sentinel("R1")
+        agent = AgentLoop(make_config(), backend=backend)
+
+        async for _ in agent.act("First"):
+            pass
+
+        # clear_history persists the transcript before truncating it, so
+        # suspending that save parks the clear while the history it is about to
+        # discard is still intact - the window in which a rewind would race it.
+        monkeypatch.setattr(agent.session_logger, "save_interaction", suspended_save)
+        clearing = asyncio.create_task(agent.clear_history())
+        await saving.wait()
+
+        assert len(agent.messages) == 3
+        assert agent._turn_boundaries == [1]
+
+        with pytest.raises(AgentLoopStateError):
+            agent.undo_last_turn()
+
+        # The refusal popped no boundary and truncated nothing, so the clear
+        # still owns exactly the transcript it saved.
+        assert len(agent.messages) == 3
+        assert agent._turn_boundaries == [1]
+
+        release.set()
+        await clearing
+
+        # The clear then completes normally and drops what it invalidated, so
+        # the rewind that was refused is now a no-op rather than a rewind.
+        assert len(agent.messages) == 1
+        assert agent.messages[0].role == Role.system
+        assert agent._turn_boundaries == []
+        assert agent.undo_last_turn() is None
 
     @pytest.mark.asyncio
     async def test_a_nested_claim_does_not_release_the_turn(self) -> None:
