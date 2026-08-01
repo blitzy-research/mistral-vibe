@@ -100,12 +100,15 @@ _MARKDOWN_LITERAL_ESCAPES = str.maketrans({
 # Escape sequence introducers and invisible direction controls survive Markdown
 # escaping untouched, and the renderer beneath the widgets filters only a handful
 # of C0 codes, so an ESC, CSI, OSC or C1 byte pasted into a prompt would reach the
-# terminal verbatim and a bidirectional override could reorder what the reader
-# sees without changing the text. Deleting them leaves every visible character in
-# place. Tab is deliberately kept, so removing a control never runs words
-# together, and line breaks never reach here because the preview is one line.
+# terminal verbatim and a bidirectional override, isolate or mark could reorder
+# what the reader sees without changing the text. Deleting them leaves every
+# visible character in place, and tab is deliberately kept, so removing a control
+# never runs words together. Carriage returns, newlines and the Unicode line and
+# paragraph separators never arrive here, because the pattern that bounds the
+# preview stops at them; every remaining vertical control is deleted here, so
+# nothing that could open a second line survives into the confirmation.
 _UNSAFE_CONTROL_CHARACTERS = re.compile(
-    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]"
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069]"
 )
 
 # Handlers that must observe a live agent turn rather than have it torn down for
@@ -116,11 +119,17 @@ _UNSAFE_CONTROL_CHARACTERS = re.compile(
 # running. Identified by handler name because registry dispatch is reflective.
 _IDLE_ONLY_COMMAND_HANDLERS = frozenset({"_undo_last_turn"})
 
+# Everything that ends a line for the purposes of quoting one: the carriage
+# return and newline a keyboard produces, and the line and paragraph separators
+# that arrive with pasted or programmatically supplied text. All four are
+# whitespace, so leaving the separators out would let one pass for indentation.
+_LINE_BREAK_CHARACTERS = r"\r\n\u2028\u2029"
+
 # How much of an undone prompt the confirmation quotes, and the single-pass match
 # that recovers it: blanks that indent the first line, then the first character
 # that is neither blank nor a line break, then at most this many more characters
 # from that same line. One character beyond the budget is enough to tell a line
-# that fits from one that must be truncated, and the leading run is bounded too,
+# that fits from one that has to be cut short, and the leading run is bounded too,
 # so the work and the memory stay bounded no matter how large, how long or how
 # many-lined the prompt was. The pattern is applied from position 0 only and
 # neither part can cross a line break, which is what confines the preview to the
@@ -128,8 +137,8 @@ _IDLE_ONLY_COMMAND_HANDLERS = frozenset({"_undo_last_turn"})
 # than reaching down the transcript for the next line that happens to have text.
 _UNDONE_PROMPT_PREVIEW_LENGTH = 80
 _UNDONE_PROMPT_FIRST_LINE = re.compile(
-    rf"[^\S\r\n]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}}"
-    rf"(\S[^\r\n]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}})"
+    rf"[^\S{_LINE_BREAK_CHARACTERS}]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}}"
+    rf"(\S[^{_LINE_BREAK_CHARACTERS}]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}})"
 )
 
 
@@ -138,15 +147,20 @@ def _summarize_undone_prompt(content: str) -> str:
 
     Returns:
         A bounded prefix of the prompt's first line with the selected escape, C1,
-        zero-width and direction controls removed and every ASCII punctuation
-        character escaped so a Markdown renderer echoes it exactly, or an empty
-        string when no nonblank character appears within that bounded prefix
+        zero-width and direction controls removed, an ellipsis standing in for
+        whatever of that line the budget could not hold, and every ASCII
+        punctuation character escaped so a Markdown renderer echoes it exactly, or
+        an empty string when that prefix holds nothing visible to quote
     """
     if (first_line := _UNDONE_PROMPT_FIRST_LINE.match(content)) is None:
         return ""
 
     preview = _UNSAFE_CONTROL_CHARACTERS.sub("", first_line[1]).rstrip()
-    if len(preview) > _UNDONE_PROMPT_PREVIEW_LENGTH:
+    # The line the reader typed decides whether anything was left out, not what
+    # survives the removals above: controls and trailing blanks inside the matched
+    # window can shrink an over-long line back within the budget, and the tail
+    # beyond it would then be dropped with nothing to show that it existed.
+    if preview and len(first_line[1]) > _UNDONE_PROMPT_PREVIEW_LENGTH:
         preview = f"{preview[: _UNDONE_PROMPT_PREVIEW_LENGTH - 1]}…"
 
     # Escaped last, so the length budget is spent on visible characters rather

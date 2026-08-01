@@ -891,6 +891,22 @@ MARKDOWN_REQUEST = "Explain **bold** and `code` in [docs](https://x.test)"
 MARKDOWN_REQUEST_SUMMARY = (
     "Explain \\*\\*bold\\*\\* and \\`code\\` in \\[docs\\]\\(https\\:\\/\\/x\\.test\\)"
 )
+# A first line that overruns the same budget, but whose opening eighty-one
+# characters shrink to twenty-two once the zero-width run and the blanks are gone.
+# Whatever the confirmation quotes, the request continued past what it can hold,
+# so an ellipsis has to say so: measuring the surviving text instead would drop
+# the tail and read as though the prompt had ended at the cache.
+ELIDED_REQUEST = (
+    "Rename the token cache" + "\u200b" * 20 + " " * 39 + "and update its callers"
+)
+ELIDED_REQUEST_SUMMARY = "Rename the token cache…"
+# Line and paragraph separators end a line as surely as a newline does, and both
+# are whitespace, so one leading a prompt could pass for indentation. The first
+# request must therefore be quoted only as far as its separator, and the second
+# quoted not at all.
+SEPARATED_REQUEST = "Split the parser\u2028then rewrite its tests"
+SEPARATED_REQUEST_SUMMARY = "Split the parser"
+LEADING_SEPARATOR_REQUEST = "\u2029Document the migration"
 # A prompt carrying an ESC-introduced screen erase, a BEL, a raw C1 control
 # sequence introducer, a right-to-left override with its terminating pop, and a
 # DEL. Markdown escaping neuters none of them, and the renderer beneath the
@@ -900,10 +916,10 @@ MARKDOWN_REQUEST_SUMMARY = (
 CONTROL_REQUEST = "Delete \x1b[2Jthe repo\x07 \x9b31m \u202ered \u202cnow\x7f"
 CONTROL_REQUEST_SUMMARY = "Delete \\[2Jthe repo 31m red now"
 # Window-title and hyperlink operating-system-command sequences, terminated by
-# BEL and by ESC-backslash respectively, alongside a bidirectional isolate pair
-# and a zero-width space.
+# BEL and by ESC-backslash respectively, alongside a bidirectional isolate pair,
+# an Arabic letter mark and a zero-width space.
 OSC_REQUEST = (
-    "Set \x1b]0;pwned\x07 title \u2066and\u2069 \u200blink"
+    "Set \x1b]0;pwned\x07 title \u2066and\u2069\u061c \u200blink"
     " \x1b]8;;https://x.test\x1b\\here\x1b]8;;\x1b\\"
 )
 # Enough lines that copying the prompt or listing its lines to find the first one
@@ -1155,6 +1171,48 @@ class TestUndoConfirmationSummary:
             )
             assert LONG_REQUEST_SUMMARY.count("…") == 1
             assert "ery retry." not in LONG_REQUEST_SUMMARY
+
+    @pytest.mark.asyncio
+    async def test_an_overrunning_line_is_marked_even_when_its_text_fits(self) -> None:
+        # Removing the invisible characters and the trailing blanks leaves this
+        # request's opening line far inside the budget, so a summary measured after
+        # those removals would look complete while the rest of the line went
+        # unmentioned. The ellipsis belongs to the line, not to what is left of it.
+        agent = await agent_with_turns(ELIDED_REQUEST)
+        app = VibeApp(agent_loop=agent)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/undo")
+
+            assert rendered(app)[-1] == (
+                "UserCommandMessage",
+                f"Undid last turn: {ELIDED_REQUEST_SUMMARY}",
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_unicode_line_separator_ends_the_quoted_line(self) -> None:
+        # A separator ends a line the way a newline does, so the words beneath one
+        # belong to a line the confirmation never quotes, and a prompt opening with
+        # one has no first line to quote at all. The separator itself must not
+        # survive either: quoting it would break the confirmation across two lines.
+        agent = await agent_with_turns(SEPARATED_REQUEST, LEADING_SEPARATOR_REQUEST)
+        app = VibeApp(agent_loop=agent)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/undo")
+
+            assert rendered(app)[-1] == ("UserCommandMessage", "Undid last turn.")
+
+            await app._handle_command("/undo")
+
+            assert rendered(app)[-1] == (
+                "UserCommandMessage",
+                f"Undid last turn: {SEPARATED_REQUEST_SUMMARY}",
+            )
 
     @pytest.mark.asyncio
     async def test_the_confirmation_keeps_markdown_punctuation_literal(self) -> None:
