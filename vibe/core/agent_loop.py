@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Iterator
+from contextlib import contextmanager
 from enum import StrEnum, auto
 from http import HTTPStatus
 from threading import Thread
@@ -129,6 +130,8 @@ class AgentLoop:
 
         self.message_observer = message_observer
         self._last_observed_message_index: int = 0
+        self._turn_boundaries: list[int] = []
+        self._active_history_mutations: int = 0
         self.enable_streaming = enable_streaming
         self.middleware_pipeline = MiddlewarePipeline()
         self._setup_middleware()
@@ -222,10 +225,31 @@ class AgentLoop:
             self.message_observer(msg)
         self._last_observed_message_index = len(self.messages)
 
+    @contextmanager
+    def _mutating_history(self) -> Iterator[None]:
+        """Claim the message history for the duration of the enclosed block.
+
+        Claims nest, so a compaction driven from inside a turn does not release
+        the turn's own claim when it finishes. While any claim is held
+        undo_last_turn refuses to rewind, because truncating the history
+        underneath an operation that still owns it would strand that operation:
+        a suspended turn would resume, contact the backend and append its reply
+        to a history the caller was already told had been rewound.
+
+        Yields:
+            None, for as long as the claim is held
+        """
+        self._active_history_mutations += 1
+        try:
+            yield
+        finally:
+            self._active_history_mutations -= 1
+
     async def act(self, msg: str) -> AsyncGenerator[BaseEvent]:
-        self._clean_message_history()
-        async for event in self._conversation_loop(msg):
-            yield event
+        with self._mutating_history():
+            self._clean_message_history()
+            async for event in self._conversation_loop(msg):
+                yield event
 
     def _setup_middleware(self) -> None:
         """Configure middleware pipeline for this conversation."""
@@ -300,6 +324,7 @@ class AgentLoop:
 
     async def _conversation_loop(self, user_msg: str) -> AsyncGenerator[BaseEvent]:
         user_message = LLMMessage(role=Role.user, content=user_msg)
+        self._turn_boundaries.append(len(self.messages))
         self.messages.append(user_message)
         self.stats.steps += 1
 
@@ -797,92 +822,159 @@ class AgentLoop:
         self.user_input_callback = callback
 
     async def clear_history(self) -> None:
-        await self.session_logger.save_interaction(
-            self.messages,
-            self.stats,
-            self._base_config,
-            self.tool_manager,
-            self.agent_profile,
-        )
-        self.messages = self.messages[:1]
-
-        self.stats = AgentStats()
-        self.stats.trigger_listeners()
-
-        try:
-            active_model = self.config.get_active_model()
-            self.stats.update_pricing(
-                active_model.input_price, active_model.output_price
+        with self._mutating_history():
+            await self.session_logger.save_interaction(
+                self.messages,
+                self.stats,
+                self._base_config,
+                self.tool_manager,
+                self.agent_profile,
             )
-        except ValueError:
-            pass
+            self.messages = self.messages[:1]
+            self._turn_boundaries.clear()
 
-        self.middleware_pipeline.reset()
-        self.tool_manager.reset_all()
-        self._reset_session()
+            self.stats = AgentStats()
+            self.stats.trigger_listeners()
+
+            try:
+                active_model = self.config.get_active_model()
+                self.stats.update_pricing(
+                    active_model.input_price, active_model.output_price
+                )
+            except ValueError:
+                pass
+
+            self.middleware_pipeline.reset()
+            self.tool_manager.reset_all()
+            self._reset_session()
+
+    def undo_last_turn(self) -> str | None:
+        """Rewind the conversation by exactly one user turn.
+
+        Truncates the message list back to the most recently recorded turn
+        boundary, discarding the user message that opened that turn together with
+        everything appended after it: the assistant reply and any tool call or
+        tool response messages. Repeated calls walk further back through the
+        transcript, one turn per call, and any out-of-range boundary is skipped.
+        The system message at index 0 always survives, cumulative session
+        statistics are deliberately left untouched so they behave as they do
+        across a reload, and no backend is contacted.
+
+        The session log is left exactly as written: the undone turn keeps the
+        records it already has, and because the logger appends only what the
+        transcript holds beyond the count it last persisted, a turn that refills
+        the rewound span is absent from that log while later turns are not.
+
+        Tool calls are removed only from the transcript; any side effect they
+        already produced is not reversed. The context-token gauge is not
+        recomputed either, so it can remain stale until the next real turn.
+
+        Returns:
+            The content of the removed user message, or None when there is no
+            recorded turn left to undo
+
+        Raises:
+            AgentLoopStateError: If a conversation turn or another history
+                operation still owns the message list, since rewinding
+                underneath it would let it resume against a history that no
+                longer exists
+        """
+        # Refuse before popping anything: a turn suspended between two of its
+        # own yields is still resumable, and truncating under it would let it
+        # reach the backend and append its reply to the rewound history.
+        if self._active_history_mutations:
+            raise AgentLoopStateError(
+                "Cannot undo while a conversation turn or a history "
+                "operation is in progress"
+            )
+
+        while self._turn_boundaries:
+            # If another caller shortens the message list without invalidating
+            # the stack, discard out-of-range boundaries before continuing backward.
+            if (boundary := self._turn_boundaries.pop()) >= len(self.messages):
+                continue
+
+            removed_content = self.messages[boundary].content
+            self.messages = self.messages[:boundary]
+
+            # Truncation can leave the observer index past the new end of the
+            # list, which would make _flush_new_messages return early and drop
+            # every later message. Programmatic and ACP embedders rely on this.
+            self._last_observed_message_index = min(
+                self._last_observed_message_index, len(self.messages)
+            )
+            return removed_content
+
+        return None
 
     async def compact(self) -> str:
         """Compact the conversation history."""
-        try:
-            self._clean_message_history()
-            await self.session_logger.save_interaction(
-                self.messages,
-                self.stats,
-                self._base_config,
-                self.tool_manager,
-                self.agent_profile,
-            )
-
-            summary_request = UtilityPrompt.COMPACT.read()
-            self.messages.append(LLMMessage(role=Role.user, content=summary_request))
-            self.stats.steps += 1
-
-            summary_result = await self._chat()
-            if summary_result.usage is None:
-                raise AgentLoopLLMResponseError(
-                    "Usage data missing in compaction summary response"
-                )
-            summary_content = summary_result.message.content or ""
-
-            system_message = self.messages[0]
-            summary_message = LLMMessage(role=Role.user, content=summary_content)
-            self.messages = [system_message, summary_message]
-
-            active_model = self.config.get_active_model()
-            provider = self.config.get_provider_for_model(active_model)
-
-            async with self.backend as backend:
-                actual_context_tokens = await backend.count_tokens(
-                    model=active_model,
-                    messages=self.messages,
-                    tools=self.format_handler.get_available_tools(self.tool_manager),
-                    extra_headers={"user-agent": get_user_agent(provider.backend)},
+        with self._mutating_history():
+            try:
+                self._clean_message_history()
+                await self.session_logger.save_interaction(
+                    self.messages,
+                    self.stats,
+                    self._base_config,
+                    self.tool_manager,
+                    self.agent_profile,
                 )
 
-            self.stats.context_tokens = actual_context_tokens
+                summary_request = UtilityPrompt.COMPACT.read()
+                self.messages.append(
+                    LLMMessage(role=Role.user, content=summary_request)
+                )
+                self.stats.steps += 1
 
-            self._reset_session()
-            await self.session_logger.save_interaction(
-                self.messages,
-                self.stats,
-                self._base_config,
-                self.tool_manager,
-                self.agent_profile,
-            )
+                summary_result = await self._chat()
+                if summary_result.usage is None:
+                    raise AgentLoopLLMResponseError(
+                        "Usage data missing in compaction summary response"
+                    )
+                summary_content = summary_result.message.content or ""
 
-            self.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
+                system_message = self.messages[0]
+                summary_message = LLMMessage(role=Role.user, content=summary_content)
+                self.messages = [system_message, summary_message]
+                self._turn_boundaries.clear()
 
-            return summary_content or ""
+                active_model = self.config.get_active_model()
+                provider = self.config.get_provider_for_model(active_model)
 
-        except Exception:
-            await self.session_logger.save_interaction(
-                self.messages,
-                self.stats,
-                self._base_config,
-                self.tool_manager,
-                self.agent_profile,
-            )
-            raise
+                async with self.backend as backend:
+                    actual_context_tokens = await backend.count_tokens(
+                        model=active_model,
+                        messages=self.messages,
+                        tools=self.format_handler.get_available_tools(
+                            self.tool_manager
+                        ),
+                        extra_headers={"user-agent": get_user_agent(provider.backend)},
+                    )
+
+                self.stats.context_tokens = actual_context_tokens
+
+                self._reset_session()
+                await self.session_logger.save_interaction(
+                    self.messages,
+                    self.stats,
+                    self._base_config,
+                    self.tool_manager,
+                    self.agent_profile,
+                )
+
+                self.middleware_pipeline.reset(reset_reason=ResetReason.COMPACT)
+
+                return summary_content or ""
+
+            except Exception:
+                await self.session_logger.save_interaction(
+                    self.messages,
+                    self.stats,
+                    self._base_config,
+                    self.tool_manager,
+                    self.agent_profile,
+                )
+                raise
 
     async def switch_agent(self, agent_name: str) -> None:
         if agent_name == self.agent_profile.name:

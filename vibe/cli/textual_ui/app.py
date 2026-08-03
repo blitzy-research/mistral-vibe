@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from enum import StrEnum, auto
 from pathlib import Path
+import re
+import string
 import subprocess
 import time
 from typing import Any, ClassVar, assert_never, cast
@@ -85,6 +87,104 @@ from vibe.core.utils import (
     is_dangerous_directory,
     logger,
 )
+
+# Backslash escapes for every ASCII punctuation character, which is exactly the
+# set CommonMark defines them for. Interpolating user text into a widget that
+# renders Markdown would otherwise let that text style itself, so translating it
+# through this table keeps it literal while leaving what the reader sees
+# unchanged: the escapes are consumed by the parser, not displayed.
+_MARKDOWN_LITERAL_ESCAPES = str.maketrans({
+    character: f"\\{character}" for character in string.punctuation
+})
+
+# Escape sequence introducers and invisible direction controls survive Markdown
+# escaping untouched, and the renderer beneath the widgets filters only a handful
+# of C0 codes, so an ESC, CSI, OSC or C1 byte pasted into a prompt would reach the
+# terminal verbatim and a bidirectional override, isolate or mark could reorder
+# what the reader sees without changing the text. Deleting them leaves every
+# visible character in place, and tab is deliberately kept, so removing a control
+# never runs words together. No logical line boundary arrives here, because the
+# pattern that bounds the preview stops at every character in
+# _LINE_BREAK_CHARACTERS below; every remaining vertical control is deleted here,
+# so nothing that could open a second line survives into the confirmation.
+_UNSAFE_CONTROL_CHARACTERS = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069]"
+)
+
+# Handlers that must observe a live agent turn rather than have it torn down for
+# them. Submitting any other input interrupts a running turn first, but a command
+# whose handler refuses while the loop is busy has to be dispatched against that
+# busy state: interrupting first would cancel the turn, possibly after a tool has
+# already had an effect, and then let the refusal proceed as if nothing had been
+# running. Identified by handler name because registry dispatch is reflective.
+_IDLE_ONLY_COMMAND_HANDLERS = frozenset({"_undo_last_turn"})
+
+# Everything that ends a line for the purposes of quoting one: the carriage
+# return and newline a keyboard produces, and the vertical tab, form feed, file,
+# group and record separators, next line, and line and paragraph separators that
+# arrive with pasted or programmatically supplied text. This is exactly the set
+# str.splitlines() recognises, which is the only defensible definition of a
+# logical line here: a boundary left out would be crossed by the pattern below
+# and then deleted as a control, splicing the line beneath it onto the one being
+# quoted. Every one of them is whitespace, so leaving any out would also let it
+# pass for indentation. The unit separator is deliberately absent, because
+# str.splitlines() does not end a line on it.
+_LINE_BREAK_CHARACTERS = r"\r\n\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+
+# How much of an undone prompt the confirmation quotes, and the single-pass match
+# that recovers it: blanks that indent the first line, then the first character
+# that is neither blank nor a line break, then at most this many more characters
+# from that same line. One character beyond the budget is enough to tell a line
+# that fits from one that has to be cut short, and the leading run is bounded too,
+# so the work and the memory stay bounded no matter how large, how long or how
+# many-lined the prompt was. The pattern is applied from position 0 only and
+# neither part can cross a line break, which is what confines the preview to the
+# first line: a prompt that opens with a blank line quotes nothing at all rather
+# than reaching down the transcript for the next line that happens to have text.
+_UNDONE_PROMPT_PREVIEW_LENGTH = 80
+_UNDONE_PROMPT_FIRST_LINE = re.compile(
+    rf"[^\S{_LINE_BREAK_CHARACTERS}]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}}"
+    rf"(\S[^{_LINE_BREAK_CHARACTERS}]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}})"
+)
+
+# What a failed rewind tells the reader, and all it tells them. An exception
+# raised anywhere under the handler carries text this application never composed
+# and cannot bound: a provider message quoting a credential, an internal path, an
+# escape or operating-system-command sequence a terminal would act on, a direction
+# override that reorders what is displayed, or simply more characters than a
+# screen can hold. The error widget expands to its message verbatim, so the
+# message has to be a constant; the exception itself goes to the log file, which
+# is where a diagnostic belongs. Deliberately does not open with "Error", because
+# the widget already prefixes that word when expanded.
+_UNDO_FAILURE_MESSAGE = (
+    "Failed to undo the last turn. The details were written to the log file."
+)
+
+
+def _summarize_undone_prompt(content: str) -> str:
+    """Reduce a recovered prompt to one short line that renders literally.
+
+    Returns:
+        A bounded prefix of the prompt's first line with the selected escape, C1,
+        zero-width and direction controls removed, an ellipsis standing in for
+        whatever of that line the budget could not hold, and every ASCII
+        punctuation character escaped so a Markdown renderer echoes it exactly, or
+        an empty string when that prefix holds nothing visible to quote
+    """
+    if (first_line := _UNDONE_PROMPT_FIRST_LINE.match(content)) is None:
+        return ""
+
+    preview = _UNSAFE_CONTROL_CHARACTERS.sub("", first_line[1]).rstrip()
+    # The line the reader typed decides whether anything was left out, not what
+    # survives the removals above: controls and trailing blanks inside the matched
+    # window can shrink an over-long line back within the budget, and the tail
+    # beyond it would then be dropped with nothing to show that it existed.
+    if preview and len(first_line[1]) > _UNDONE_PROMPT_PREVIEW_LENGTH:
+        preview = f"{preview[: _UNDONE_PROMPT_PREVIEW_LENGTH - 1]}…"
+
+    # Escaped last, so the length budget is spent on visible characters rather
+    # than on backslashes the parser consumes.
+    return preview.translate(_MARKDOWN_LITERAL_ESCAPES)
 
 
 class BottomApp(StrEnum):
@@ -258,7 +358,7 @@ class VibeApp(App):  # noqa: PLR0904
         input_widget = self.query_one(ChatInputContainer)
         input_widget.value = ""
 
-        if self._agent_running:
+        if self._agent_running and not self._requires_idle_agent(value):
             await self._interrupt_agent_loop()
 
         if value.startswith("!"):
@@ -388,9 +488,31 @@ class VibeApp(App):  # noqa: PLR0904
             tool_name, ToolPermission.ALWAYS, save_permanently
         )
 
+    def _requires_idle_agent(self, user_input: str) -> bool:
+        """Report whether submitting this input must leave a running turn alone.
+
+        Returns:
+            True when the input resolves to a command whose handler refuses to
+            run while the agent loop is busy, and which therefore has to reach
+            that handler with the turn still running
+        """
+        if command := self.commands.find_command(user_input):
+            return command.handler in _IDLE_ONLY_COMMAND_HANDLERS
+        return False
+
     async def _handle_command(self, user_input: str) -> bool:
         if command := self.commands.find_command(user_input):
-            await self._mount_and_scroll(UserMessage(user_input))
+            # An idle-only command is the one kind that can be echoed while a
+            # turn is still streaming, because the submit path deliberately does
+            # not interrupt on its behalf. Closing the stream out to make room for
+            # that echo would leave the next chunk to open a second assistant
+            # widget, splitting one reply in two and making the view disagree with
+            # the single assistant message the transcript holds, so the open
+            # widget is kept and the echo simply lands beneath it.
+            await self._mount_and_scroll(
+                UserMessage(user_input),
+                preserve_stream=command.handler in _IDLE_ONLY_COMMAND_HANDLERS,
+            )
             handler = getattr(self, command.handler)
             if asyncio.iscoroutinefunction(handler):
                 await handler()
@@ -704,6 +826,99 @@ class VibeApp(App):  # noqa: PLR0904
                 ErrorMessage(
                     f"Failed to clear history: {e}", collapsed=self._tools_collapsed
                 )
+            )
+
+    async def _undo_last_turn(self) -> None:
+        # Rewinding the transcript underneath a live turn would corrupt the
+        # display, so refuse while the loop is busy, as compaction does. The
+        # submitted input reaches this guard with the turn still running, because
+        # _IDLE_ONLY_COMMAND_HANDLERS keeps the submit path from interrupting on
+        # this command's behalf; without that the guard could never fire.
+        if self._agent_running:
+            # The refusal is mounted beneath a turn that is still streaming, so it
+            # must leave that stream open for exactly the reason the echo does:
+            # a refused rewind changes nothing, and it must not split the reply
+            # arriving around it across two assistant widgets either.
+            await self._mount_and_scroll(
+                ErrorMessage(
+                    "Cannot undo while agent loop is processing. Please wait.",
+                    collapsed=self._tools_collapsed,
+                ),
+                preserve_stream=True,
+            )
+            return
+
+        undone: str | None = None
+        try:
+            # Synchronous by design: the rewind is a local list truncation that
+            # never contacts the backend and never touches session statistics.
+            undone = self.agent_loop.undo_last_turn()
+            if undone is None:
+                # A no-op must destroy nothing on screen, so report and return
+                # before any teardown: the command echo already mounted by
+                # _handle_command survives untouched.
+                await self._mount_and_scroll(UserCommandMessage("Nothing to undo."))
+                return
+
+            await self._render_rewound_transcript()
+
+            # The preview is one bounded, sanitized line, so a prompt of any size
+            # cannot flood the confirmation or smuggle an escape sequence into it.
+            # The fixed leading text keeps that content off the start of the line,
+            # so a leading "#" cannot be rendered as a heading by the widget's
+            # Markdown child, and a prompt with nothing worth quoting confirms
+            # without a trailing colon phrase.
+            preview = _summarize_undone_prompt(undone)
+            await self._mount_and_scroll(
+                UserCommandMessage(
+                    f"Undid last turn: {preview}" if preview else "Undid last turn."
+                )
+            )
+
+        except Exception as failure:
+            # The rewind is already committed by the time anything above it can
+            # fail, so the screen would otherwise be left disagreeing with the
+            # transcript: still showing the removed turn, or blank because it was
+            # cleared and never rebuilt. Bring it back onto the message list
+            # before reporting, and report either way.
+            if undone is not None:
+                await self._recover_rewound_transcript()
+            # Recorded privately and in full, including the traceback, so nothing
+            # is lost by keeping it off a screen that is also a terminal.
+            logger.error("Failed to undo the last turn", exc_info=failure)
+            await self._mount_and_scroll(
+                ErrorMessage(_UNDO_FAILURE_MESSAGE, collapsed=self._tools_collapsed)
+            )
+
+    async def _render_rewound_transcript(self) -> None:
+        """Render the message area from the transcript a rewind left behind.
+
+        Any streaming widget is closed out before the area is emptied, so none is
+        orphaned by the removal, and the surviving transcript is rebuilt while the
+        area is still empty, because the rebuild routine returns early whenever
+        children are present. Only then is the command echo restored, which is the
+        one way this ordering differs from the clear-history flow.
+        """
+        await self._finalize_current_streaming_message()
+        messages_area = self.query_one("#messages")
+        await messages_area.remove_children()
+        await self._rebuild_history_from_messages()
+        await messages_area.mount(UserMessage("/undo"))
+
+    async def _recover_rewound_transcript(self) -> None:
+        """Re-render the message area once after a rewind failed to display.
+
+        The message list is authoritative and has already been truncated, so the
+        same render is simply attempted again. A recovery that fails in turn is
+        recorded rather than raised, because the failure that prompted it is the
+        one the user needs to be told about.
+        """
+        try:
+            await self._render_rewound_transcript()
+        except Exception as recovery_failure:
+            logger.debug(
+                "Failed to re-render the transcript after undo",
+                exc_info=recovery_failure,
             )
 
     async def _show_log_path(self) -> None:
@@ -1068,7 +1283,9 @@ class VibeApp(App):  # noqa: PLR0904
         await widget.write_initial_content()
         return widget
 
-    async def _mount_and_scroll(self, widget: Widget) -> None:
+    async def _mount_and_scroll(
+        self, widget: Widget, *, preserve_stream: bool = False
+    ) -> None:
         messages_area = self.query_one("#messages")
         chat = self.query_one("#chat", VerticalScroll)
         was_at_bottom = self._is_scrolled_to_bottom(chat)
@@ -1099,7 +1316,13 @@ class VibeApp(App):  # noqa: PLR0904
                 self._current_streaming_message = result
             self._current_streaming_reasoning = None
         else:
-            await self._finalize_current_streaming_message()
+            # Anything that is not itself part of a stream normally closes the open
+            # stream out, because it is arriving after the model finished. A caller
+            # that knows better - one mounting beneath a turn that is still running
+            # - asks for the stream to be preserved, so the widget the next chunk
+            # belongs to stays open and that reply is not split in two.
+            if not preserve_stream:
+                await self._finalize_current_streaming_message()
             await messages_area.mount(widget)
 
             is_tool_message = isinstance(widget, (ToolCallMessage, ToolResultMessage))

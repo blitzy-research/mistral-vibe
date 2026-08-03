@@ -46,6 +46,11 @@ class CommandRegistry:
                 description="Compact conversation history by summarizing",
                 handler="_compact_history",
             ),
+            "undo": Command(
+                aliases=frozenset(["/undo"]),
+                description="Undo the last conversation turn",
+                handler="_undo_last_turn",
+            ),
             "exit": Command(
                 aliases=frozenset(["/exit"]),
                 description="Exit the application",
