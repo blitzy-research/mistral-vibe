@@ -103,10 +103,10 @@ _MARKDOWN_LITERAL_ESCAPES = str.maketrans({
 # terminal verbatim and a bidirectional override, isolate or mark could reorder
 # what the reader sees without changing the text. Deleting them leaves every
 # visible character in place, and tab is deliberately kept, so removing a control
-# never runs words together. Carriage returns, newlines and the Unicode line and
-# paragraph separators never arrive here, because the pattern that bounds the
-# preview stops at them; every remaining vertical control is deleted here, so
-# nothing that could open a second line survives into the confirmation.
+# never runs words together. No logical line boundary arrives here, because the
+# pattern that bounds the preview stops at every character in
+# _LINE_BREAK_CHARACTERS below; every remaining vertical control is deleted here,
+# so nothing that could open a second line survives into the confirmation.
 _UNSAFE_CONTROL_CHARACTERS = re.compile(
     r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069]"
 )
@@ -120,10 +120,16 @@ _UNSAFE_CONTROL_CHARACTERS = re.compile(
 _IDLE_ONLY_COMMAND_HANDLERS = frozenset({"_undo_last_turn"})
 
 # Everything that ends a line for the purposes of quoting one: the carriage
-# return and newline a keyboard produces, and the line and paragraph separators
-# that arrive with pasted or programmatically supplied text. All four are
-# whitespace, so leaving the separators out would let one pass for indentation.
-_LINE_BREAK_CHARACTERS = r"\r\n\u2028\u2029"
+# return and newline a keyboard produces, and the vertical tab, form feed, file,
+# group and record separators, next line, and line and paragraph separators that
+# arrive with pasted or programmatically supplied text. This is exactly the set
+# str.splitlines() recognises, which is the only defensible definition of a
+# logical line here: a boundary left out would be crossed by the pattern below
+# and then deleted as a control, splicing the line beneath it onto the one being
+# quoted. Every one of them is whitespace, so leaving any out would also let it
+# pass for indentation. The unit separator is deliberately absent, because
+# str.splitlines() does not end a line on it.
+_LINE_BREAK_CHARACTERS = r"\r\n\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
 
 # How much of an undone prompt the confirmation quotes, and the single-pass match
 # that recovers it: blanks that indent the first line, then the first character
@@ -139,6 +145,19 @@ _UNDONE_PROMPT_PREVIEW_LENGTH = 80
 _UNDONE_PROMPT_FIRST_LINE = re.compile(
     rf"[^\S{_LINE_BREAK_CHARACTERS}]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}}"
     rf"(\S[^{_LINE_BREAK_CHARACTERS}]{{0,{_UNDONE_PROMPT_PREVIEW_LENGTH}}})"
+)
+
+# What a failed rewind tells the reader, and all it tells them. An exception
+# raised anywhere under the handler carries text this application never composed
+# and cannot bound: a provider message quoting a credential, an internal path, an
+# escape or operating-system-command sequence a terminal would act on, a direction
+# override that reorders what is displayed, or simply more characters than a
+# screen can hold. The error widget expands to its message verbatim, so the
+# message has to be a constant; the exception itself goes to the log file, which
+# is where a diagnostic belongs. Deliberately does not open with "Error", because
+# the widget already prefixes that word when expanded.
+_UNDO_FAILURE_MESSAGE = (
+    "Failed to undo the last turn. The details were written to the log file."
 )
 
 
@@ -856,7 +875,7 @@ class VibeApp(App):  # noqa: PLR0904
                 )
             )
 
-        except Exception as e:
+        except Exception as failure:
             # The rewind is already committed by the time anything above it can
             # fail, so the screen would otherwise be left disagreeing with the
             # transcript: still showing the removed turn, or blank because it was
@@ -864,8 +883,11 @@ class VibeApp(App):  # noqa: PLR0904
             # before reporting, and report either way.
             if undone is not None:
                 await self._recover_rewound_transcript()
+            # Recorded privately and in full, including the traceback, so nothing
+            # is lost by keeping it off a screen that is also a terminal.
+            logger.error("Failed to undo the last turn", exc_info=failure)
             await self._mount_and_scroll(
-                ErrorMessage(f"Failed to undo: {e}", collapsed=self._tools_collapsed)
+                ErrorMessage(_UNDO_FAILURE_MESSAGE, collapsed=self._tools_collapsed)
             )
 
     async def _render_rewound_transcript(self) -> None:

@@ -6,16 +6,18 @@ import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 import json
+import logging
 from pathlib import Path
 from typing import NamedTuple
 import unicodedata
+from xml.etree import ElementTree
 
 import pytest
 from textual.widget import Widget
 
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
-from vibe.cli.textual_ui.app import VibeApp
+from vibe.cli.textual_ui.app import VibeApp, _summarize_undone_prompt
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
 from vibe.cli.textual_ui.widgets.messages import (
     AssistantMessage,
@@ -907,6 +909,27 @@ ELIDED_REQUEST_SUMMARY = "Rename the token cache…"
 SEPARATED_REQUEST = "Split the parser\u2028then rewrite its tests"
 SEPARATED_REQUEST_SUMMARY = "Split the parser"
 LEADING_SEPARATOR_REQUEST = "\u2029Document the migration"
+# Every character Python treats as ending a line, named so a failure says which
+# one escaped. Enumerating them here rather than deriving them from the pattern
+# under test is the point: the separators a hand-written pattern is most likely to
+# omit are exactly the ones nobody types, and each of them is also whitespace and
+# also a control, so an omission is invisible twice over — the pattern crosses the
+# boundary and the removal of unsafe controls then deletes the evidence, splicing
+# the line beneath onto the line being quoted.
+LOGICAL_LINE_BREAKS = {
+    "line feed": "\n",
+    "carriage return": "\r",
+    "vertical tab": "\x0b",
+    "form feed": "\x0c",
+    "file separator": "\x1c",
+    "group separator": "\x1d",
+    "record separator": "\x1e",
+    "next line": "\x85",
+    "line separator": "\u2028",
+    "paragraph separator": "\u2029",
+}
+# What must never reach the confirmation from a line the reader believed removed.
+SECOND_LINE_SECRET = "SECRET_SECOND_LINE"
 # A prompt carrying an ESC-introduced screen erase, a BEL, a raw C1 control
 # sequence introducer, a right-to-left override with its terminating pop, and a
 # DEL. Markdown escaping neuters none of them, and the renderer beneath the
@@ -925,6 +948,34 @@ OSC_REQUEST = (
 # Enough lines that copying the prompt or listing its lines to find the first one
 # would be plainly wasteful.
 HOSTILE_LINE_COUNT = 20_000
+# The one thing a failed rewind is allowed to say. Written out here rather than
+# imported from the application, because a test that compared that constant with
+# itself would keep passing even if it grew back a placeholder for the exception.
+UNDO_FAILURE_MESSAGE = (
+    "Failed to undo the last turn. The details were written to the log file."
+)
+# Exceptions a failed rewind must reveal nothing of. The first carries a
+# credential and an internal path of the kind a provider or a traceback supplies;
+# the next four bracket the preview budget and then leave it far behind, because a
+# message the application does not compose has no length it must respect; the last
+# two carry a hyperlink escape sequence a terminal would act on, terminated the
+# two ways terminals accept, and a direction override that reorders what follows
+# it. None of them is a prompt, so none of them passes through the preview.
+HOSTILE_FAILURES = {
+    "credential and path": (
+        "SECRET_TOKEN=qa-do-not-leak path=/home/internal/private.py:77"
+    ),
+    "nothing at all": "",
+    "exactly the budget": "P" * 80,
+    "one past the budget": "P" * 81,
+    "far past the budget": "P" * 100_000,
+    "hyperlink ended by a bell": (
+        "SECRET\x1b]8;;https://evil.invalid\x07CLICK\x1b]8;;\x07\u202eRTL"
+    ),
+    "hyperlink ended by a string terminator": (
+        "SECRET\x1b]8;;https://evil.invalid\x1b\\CLICK\x1b]8;;\x1b\\\u202eRTL"
+    ),
+}
 
 
 def make_ui_config() -> VibeConfig:
@@ -1213,6 +1264,61 @@ class TestUndoConfirmationSummary:
                 "UserCommandMessage",
                 f"Undid last turn: {SEPARATED_REQUEST_SUMMARY}",
             )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("name", "separator"), sorted(LOGICAL_LINE_BREAKS.items()))
+    async def test_every_logical_line_break_ends_the_quoted_line(
+        self, name: str, separator: str
+    ) -> None:
+        # One case per character Python ends a line on, because the confirmation
+        # persists in the scrollback: content the reader watched the rewind remove
+        # would otherwise survive there as its only remaining on-screen copy. A
+        # separator opening a prompt leaves an empty first line and so nothing to
+        # quote; one inside a prompt stops the quotation where it stands, rather
+        # than vanishing and joining the two lines into a sentence never written.
+        agent = await agent_with_turns(
+            f"{separator}{SECOND_LINE_SECRET}", f"FIRST{separator}{SECOND_LINE_SECRET}"
+        )
+        app = VibeApp(agent_loop=agent)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/undo")
+
+            assert rendered(app)[-1] == (
+                "UserCommandMessage",
+                "Undid last turn: FIRST",
+            ), f"an interior {name} did not end the quoted line"
+
+            await app._handle_command("/undo")
+
+            assert rendered(app)[-1] == ("UserCommandMessage", "Undid last turn."), (
+                f"a leading {name} did not empty the quoted line"
+            )
+
+    def test_the_quoted_line_ends_exactly_where_python_ends_a_line(self) -> None:
+        # The boundary set is hand-written, and the previous omission of six
+        # characters was invisible until a prompt carried one, so pin it to the
+        # authority instead of to another hand-written list: every character
+        # str.splitlines() breaks on must stop the preview, and no other character
+        # may. The scan covers every code point up to the last separator Python
+        # recognises, so a boundary cannot hide beyond the end of the range.
+        broken_by_python = {
+            chr(code_point)
+            for code_point in range(ord("\u2029") + 1)
+            if len(f"a{chr(code_point)}b".splitlines()) > 1
+        }
+
+        assert broken_by_python == set(LOGICAL_LINE_BREAKS.values())
+
+        stopped_by_preview = {
+            chr(code_point)
+            for code_point in range(ord("\u2029") + 1)
+            if _summarize_undone_prompt(f"FIRST{chr(code_point)}SECOND") == "FIRST"
+        }
+
+        assert stopped_by_preview == broken_by_python
 
     @pytest.mark.asyncio
     async def test_the_confirmation_keeps_markdown_punctuation_literal(self) -> None:
@@ -1618,7 +1724,7 @@ class TestUndoFailuresAreReported:
                 ("UserMessage", "First"),
                 ("AssistantMessage", "R1"),
                 ("UserMessage", "/undo"),
-                ("ErrorMessage", "Failed to undo: rewind exploded"),
+                ("ErrorMessage", UNDO_FAILURE_MESSAGE),
             ]
 
     @pytest.mark.asyncio
@@ -1640,9 +1746,7 @@ class TestUndoFailuresAreReported:
             # Re-rendering is attempted again before reporting, but a failure that
             # persists cannot be recovered from: what matters is that the user is
             # told, rather than left with an unexplained blank transcript.
-            assert rendered(app) == [
-                ("ErrorMessage", "Failed to undo: rebuild exploded")
-            ]
+            assert rendered(app) == [("ErrorMessage", UNDO_FAILURE_MESSAGE)]
 
         assert len(agent.messages) == 1
 
@@ -1686,7 +1790,7 @@ class TestUndoFailuresAreReported:
                 ("UserMessage", "First"),
                 ("AssistantMessage", "R1"),
                 ("UserMessage", "/undo"),
-                ("ErrorMessage", "Failed to undo: render exploded"),
+                ("ErrorMessage", UNDO_FAILURE_MESSAGE),
             ]
 
         assert [message.role for message in agent.messages] == [
@@ -1725,7 +1829,141 @@ class TestUndoFailuresAreReported:
                 ("UserMessage", "First"),
                 ("AssistantMessage", "R1"),
                 ("UserMessage", "/undo"),
-                ("ErrorMessage", "Failed to undo: rebuild exploded"),
+                ("ErrorMessage", UNDO_FAILURE_MESSAGE),
             ]
 
         assert len(agent.messages) == 3
+
+
+class TestUndoFailuresDiscloseNothing:
+    """A failure report says what went wrong, never what the exception said.
+
+    Whatever raises under the handler composed its own text: a provider quoting a
+    credential, a traceback naming an internal path, an escape sequence a terminal
+    would act on, a direction override, or a message longer than any screen. The
+    error widget expands to its message verbatim and that message is written to a
+    terminal, so the report has to be a constant and the exception has to go to the
+    log instead. The fixtures below carry each of those hazards.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("name", "payload"), sorted(HOSTILE_FAILURES.items()))
+    async def test_a_failure_reports_the_same_bounded_text_whatever_raised(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, payload: str
+    ) -> None:
+        agent = await agent_with_turns("First")
+        app = VibeApp(agent_loop=agent)
+
+        def failing_rewind() -> str | None:
+            raise RuntimeError(payload)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            monkeypatch.setattr(agent, "undo_last_turn", failing_rewind)
+            await app._handle_command("/undo")
+
+            reported = app.query_one(ErrorMessage)
+
+            # Identical for every payload, so its length is the constant's length
+            # and no exception can decide how much of the screen it occupies.
+            assert reported._error == UNDO_FAILURE_MESSAGE, (
+                f"a {name} exception changed the reported text"
+            )
+            # What the terminal receives once the reader expands the report. The
+            # widget prefixes "Error: " itself, which is why the constant must not
+            # open with that word.
+            assert reported._get_text() == "Error. (ctrl+o to expand)"
+
+            await app.action_toggle_tool()
+            await pilot.pause()
+
+            expanded = reported._get_text()
+
+            assert expanded == f"Error: {UNDO_FAILURE_MESSAGE}"
+            assert payload == "" or payload not in expanded
+            assert "https://evil.invalid" not in expanded
+            assert not [
+                character
+                for character in expanded
+                if unicodedata.category(character).startswith("C")
+            ]
+
+    @pytest.mark.asyncio
+    async def test_a_failure_reaches_the_screen_free_of_terminal_controls(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The widget text is one hop short of the terminal, so take the last one
+        # too: a raw escape byte in the rendered output makes even the application's
+        # own export malformed, and a terminal that recovers instead of failing acts
+        # on the sequence.
+        agent = await agent_with_turns("First")
+        app = VibeApp(agent_loop=agent)
+        payload = HOSTILE_FAILURES["hyperlink ended by a bell"]
+
+        def failing_rewind() -> str | None:
+            raise RuntimeError(payload)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            monkeypatch.setattr(agent, "undo_last_turn", failing_rewind)
+            await app._handle_command("/undo")
+            await app.action_toggle_tool()
+            # The report is the last thing in a transcript taller than the screen,
+            # so bring it into view and let the scroll settle before drawing: an
+            # export taken mid-scroll would show the banner and prove nothing.
+            app.query_one("#chat").scroll_end(animate=False)
+            await pilot.pause()
+            await pilot.pause()
+
+            exported = app.export_screenshot()
+
+        # Parses, so no raw escape byte survived: an ESC is not valid character
+        # data and would make this raise instead.
+        drawn = ElementTree.fromstring(exported)
+
+        assert "SECRET" not in exported
+        assert "https://evil.invalid" not in exported
+        assert "\x1b" not in exported
+        assert "\u202e" not in exported
+        # The export writes each glyph run as character data with its blanks held
+        # apart, so read the drawing back as text before looking for the sentence
+        # the reader actually sees.
+        shown = " ".join(node.text or "" for node in drawn.iter()).replace("\xa0", " ")
+
+        assert "Error: Failed to undo the last turn." in shown
+
+    @pytest.mark.asyncio
+    async def test_the_exception_is_recorded_in_the_log_it_is_kept_out_of_sight_for(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Keeping the exception off the screen must not lose it: the diagnostic
+        # belongs in the log file, in full and with its traceback, which is the
+        # only reason the screen can afford to say so little.
+        agent = await agent_with_turns("First")
+        app = VibeApp(agent_loop=agent)
+        payload = HOSTILE_FAILURES["credential and path"]
+
+        def failing_rewind() -> str | None:
+            raise RuntimeError(payload)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            monkeypatch.setattr(agent, "undo_last_turn", failing_rewind)
+            with caplog.at_level(logging.ERROR, logger="vibe"):
+                await app._handle_command("/undo")
+
+            assert rendered(app)[-1] == ("ErrorMessage", UNDO_FAILURE_MESSAGE)
+
+        recorded = [
+            record
+            for record in caplog.records
+            if record.message == "Failed to undo the last turn"
+        ]
+
+        assert len(recorded) == 1
+        assert recorded[0].levelno == logging.ERROR
+        assert recorded[0].exc_info is not None
+        assert payload in str(recorded[0].exc_info[1])
