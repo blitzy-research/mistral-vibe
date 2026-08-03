@@ -1019,10 +1019,14 @@ class GuardedPrompt(str):
     __slots__ = ()
 
     def strip(self, chars: str | None = None, /) -> str:
-        raise AssertionError("the preview must not copy the whole prompt")
+        raise AssertionError(
+            f"the preview must not copy the whole prompt (chars={chars!r})"
+        )
 
     def splitlines(self, keepends: bool = False) -> list[str]:
-        raise AssertionError("the preview must not materialise every line")
+        raise AssertionError(
+            f"the preview must not materialise every line (keepends={keepends!r})"
+        )
 
 
 def start_stalled_turn(app: VibeApp) -> asyncio.Task[None]:
